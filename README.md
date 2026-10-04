@@ -11,8 +11,8 @@ launches the latest release (or the latest snapshot with -s), or the version giv
   -s, --snapshot     launch the latest snapshot instead of the latest release
                      (with -l: include snapshots in the list)
   -v, --version VER  launch this version instead of the latest (see -l)
-  -d, --dir PATH     game directory (default: /home/odd/.odd/minecell/instance)
-  -n, --name NAME    player name (default: TheOddCell)
+  -d, --dir PATH     game directory (default: /home/$USER/.odd/minecell/instance)
+  -n, --name NAME    player name (default: $USER)
   -m, --mem SIZE     max heap, e.g. 4G
   -j, --java PATH    java binary (default: java)
   -S, --server HOST  join a server straight away
