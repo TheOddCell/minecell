@@ -17,6 +17,7 @@ server=""
 want=""
 notype="false"
 skinof=""
+fabric="false"
 dryrun="false"
 list="false"
 version=""
@@ -39,13 +40,14 @@ write_conf() {
 # snapshot="false"
 # version=""
 # skin_of=""
+# fabric="false"
 EOF
 }
 load_conf() {
-  local dir="" name="" mem="" java="" server="" snapshot="" version="" skin_of=""
+  local dir="" name="" mem="" java="" server="" snapshot="" version="" skin_of="" fabric=""
   . "$conf"
   cfg_dir="$dir"; cfg_name="$name"; cfg_mem="$mem"; cfg_java="$java"
-  cfg_server="$server"; cfg_snapshot="$snapshot"; cfg_version="$version"; cfg_skin_of="$skin_of"
+  cfg_server="$server"; cfg_snapshot="$snapshot"; cfg_version="$version"; cfg_skin_of="$skin_of"; cfg_fabric="$fabric"
 }
 if ! grep -qv -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$conf" 2>/dev/null; then
   write_conf
@@ -62,6 +64,7 @@ else
   if [ "$cfg_snapshot" = "true" ]; then snapshot="true"; fi
   if [ -n "$cfg_version" ]; then want="$cfg_version"; fi
   if [ -n "$cfg_skin_of" ]; then skinof="$cfg_skin_of"; fi
+  if [ "$cfg_fabric" = "true" ]; then fabric="true"; fi
 fi
 defdir="$gamedir"
 defname="$name"
@@ -80,6 +83,7 @@ launches the latest release (or the latest snapshot with -s), or the version giv
   -j, --java PATH    java binary (default: java)
   -S, --server HOST  join a server straight away
   -l, --list         list available versions, one per line (releases; add -s for snapshots too, shown as "version type")
+  -f, --fabric       run the chosen version with the latest stable fabric loader (downloaded once)
   -k, --skin-of NAME use the skin of this real minecraft account (looks up its uuid)
   -T, --no-type      with -l -s: print only the version, not its type
       --dry-run      print the java command instead of running it
@@ -143,6 +147,9 @@ for i in "$@"; do
     continue
   elif [ "$i" = "--version" ] || [ "$i" = "-v" ]; then
     want="hahayoubrokesomething"
+    continue
+  elif [ "$i" = "--fabric" ] || [ "$i" = "-f" ]; then
+    fabric="true"
     continue
   elif [ "$i" = "--skin-of" ] || [ "$i" = "-k" ]; then
     skinof="hahayoubrokesomething"
@@ -215,6 +222,29 @@ elif "$snapshot"; then
   version="$(jq .latest.snapshot -r "$manifest")"
 else
   version="$(jq .latest.release -r "$manifest")"
+fi
+if $fabric; then
+  # latest stable fabric loader for this game version (newest overall if none is stable)
+  mcver="$version"
+  fv="$(curl -fsSL "https://meta.fabricmc.net/v2/versions/loader/$mcver" \
+        | jq -er '([.[] | select(.loader.stable)] + .)[0].loader.version')" || fv=""
+  if [ -n "$fv" ]; then
+    fid="fabric-loader-$fv-$mcver"
+    fjson="$cachedir/versions/$fid/$fid.json"
+    if ! [ -f "$fjson" ]; then
+      mkdir -p "$(dirname "$fjson")"
+      curl -fsSL -o "$fjson.new" "https://meta.fabricmc.net/v2/versions/loader/$mcver/$fv/profile/json" \
+        && jq -e .id "$fjson.new" > /dev/null \
+        || { rm -f "$fjson.new"; echo "minecell: could not download the fabric profile for $mcver" >&2; exit 1; }
+      mv "$fjson.new" "$fjson"
+    fi
+  else
+    # offline, or fabric doesn't support this version: fall back to the newest one we already have
+    fid="$(ls -1v "$cachedir/versions" 2>/dev/null | grep -E "^fabric-loader-.+-${mcver//./\.}\$" | tail -1)"
+    [ -n "$fid" ] || { echo "minecell: no fabric loader found for $mcver" >&2; exit 1; }
+    echo "minecell: could not ask fabric for the latest loader, using $fid" >&2
+  fi
+  version="$fid"
 fi
 echo "version $version"
 # each version keeps its jar (and natives) in its own dir; they all share the one instance dir
