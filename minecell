@@ -23,6 +23,17 @@ list="false"
 version=""
 passthrough="false"
 extra=()
+# dependencies: every external command the script uses, with the package it usually comes from
+missingdeps=()
+for dep in curl:curl jq:jq sed:sed grep:grep sha1sum:coreutils md5sum:coreutils mktemp:coreutils \
+           cut:coreutils sort:coreutils wc:coreutils ln:coreutils mv:coreutils mkdir:coreutils \
+           dirname:coreutils xargs:findutils find:findutils; do
+  command -v "${dep%%:*}" > /dev/null || missingdeps+=("${dep%%:*} (${dep##*:})")
+done
+if [ "${#missingdeps[@]}" -gt 0 ]; then
+  echo "minecell: missing required programs: ${missingdeps[*]}" >&2
+  exit 1
+fi
 # config file: sets the defaults, command line options override it. it is (re)written with every
 # line commented out when it is missing or has nothing but comments in it
 conf="${MINECELL_CONFIG:-$HOME/.odd/minecell.conf}"
@@ -182,10 +193,14 @@ for v in "$gamedir" "$name" "$mem" "$java" "$server" "$want" "$skinof"; do
     exit 1
   fi
 done
+# java is only needed to actually launch (not for --list or --dry-run)
+if ! $list && ! $dryrun && ! command -v "$java" > /dev/null; then
+  echo "minecell: java not found ($java): install a jdk or point -j at one" >&2
+  exit 1
+fi
 # fd 3 is the real stdout: in --dry-run everything but the raw command (and -l's list) goes to stderr
 exec 3>&1
 if $dryrun; then exec 1>&2; fi
-echo "minecell $VERSION reporting for duty"
 if $fakecache; then
   echo "minecell: warning: ~/.odd/minecell doesn't exist, so this run uses a throwaway cache in $cachedir" >&2
   echo "minecell: nothing is kept (downloads, worlds, instance). run: mkdir ~/.odd/minecell" >&2

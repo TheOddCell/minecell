@@ -1,0 +1,68 @@
+#!/bin/bash
+tput smcup
+clear
+echo "minecell - type"
+mkdir -p "$HOME/.odd/minecell"
+args=''
+type="$(gum choose --header='What version would you like to play?' 'Release' 'Snapshot' 'Fabric' 'Fabric Snapshot')"
+if [ "$type" = "Release" ]; then
+  clear
+  echo "minecell - release - pick version"
+  version="$(./minecell -l|gum choose)"
+  if [ -z "$version" ] || [ "$version" = "nothing selected" ]; then
+    args="$args"
+  else
+    args="$args -v $version"
+  fi
+if [ "$type" = "Fabric" ]; then
+  clear
+  echo "minecell - release (fabric) - pick version"
+  version="$(./minecell -l|gum choose)"
+  if [ -z "$version" ] || [ "$version" = "nothing selected" ]; then
+    args="$args -f"
+  else
+    args="$args -v $version -f"
+  fi
+if [ "$type" = "Snapshot" ]; then
+  clear
+  echo "minecell - snapshot - pick version"
+  version="$(./minecell -l -s -T|gum choose)"
+  if [ -z "$version" ] || [ "$version" = "nothing selected" ]; then
+    args="$args -s"
+  else
+    args="$args -v $version"
+  fi
+if [ "$type" = "Fabric Snapshot" ]; then
+  clear
+  echo "minecell - snapshot (fabric) - pick version"
+  version="$(./minecell -l -s -T|gum choose)"
+  if [ -z "$version" ] || [ "$version" = "nothing selected" ]; then
+    args="$args -s -f"
+  else
+    args="$args -v $version -f"
+  fi
+fi
+clear
+echo "minecell - user - name"
+echo "type in your username or press esc to use $USER"
+username="$(gum input --placeholder="$USER")"
+if [ -z "$username" ] || [ "$username" = "not submitted" ]; then
+  args="$args"
+else
+  args="$args -n '$username'"
+  clear
+  echo "minecell - user - skin"
+  if [ "$(gum choose --header='would you like to use the skin accociated with this minecraft account?' yes no)" = "yes" ]; then
+    args="$args -k '$username'"
+  fi
+fi
+clear
+keep="$(gum choose --header='would you like to save this config?' yes no)"
+clear
+tput rmcup
+bash <(curl -fsSL https://git.tarxz.zip/odd/minecell/raw/branch/main/minecell) $args
+if [ "$keep" = "yes" ]; then
+  cat ~/.odd/minecell.conf|tail -9|sed 's/# //g'>~/.odd/minecell.conf
+  echo "you may reuse this config by running"
+  echo '  bash <(curl -fsSL https://git.tarxz.zip/odd/minecell/raw/branch/main/minecell)'
+fi

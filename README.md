@@ -17,6 +17,8 @@ launches the latest release (or the latest snapshot with -s), or the version giv
   -j, --java PATH    java binary (default: java)
   -S, --server HOST  join a server straight away
   -l, --list         list available versions, one per line (releases; add -s for snapshots too, shown as "version type")
+  -f, --fabric       run the chosen version with the latest stable fabric loader (downloaded once)
+  -k, --skin-of NAME use the skin of this real minecraft account (looks up its uuid)
   -T, --no-type      with -l -s: print only the version, not its type
       --dry-run      print the java command instead of running it
   -h, --help         show this help
