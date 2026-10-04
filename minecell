@@ -205,26 +205,53 @@ if $list; then
 fi
 if [ -n "$want" ]; then
   version="$want"
-  jq -e --arg v "$version" '.versions[] | select(.id == $v)' "$manifest" > /dev/null \
-    || { echo "minecell: no such version: $version (try -l, or -l -s for snapshots)" >&2; exit 1; }
+  case "$version" in */*) echo "minecell: bad version: $version" >&2; exit 1 ;; esac
+  # a version json that is already in versions/ is accepted even if the manifest doesn't know it
+  if ! [ -f "$cachedir/versions/$version/$version.json" ]; then
+    jq -e --arg v "$version" '.versions[] | select(.id == $v)' "$manifest" > /dev/null \
+      || { echo "minecell: no such version: $version (try -l, or -l -s for snapshots)" >&2; exit 1; }
+  fi
 elif "$snapshot"; then
   version="$(jq .latest.snapshot -r "$manifest")"
 else
   version="$(jq .latest.release -r "$manifest")"
 fi
 echo "version $version"
-gamejsonurl="$(jq -er --arg v "$version" '.versions[] | select(.id == $v) | .url' "$manifest")"
 # each version keeps its jar (and natives) in its own dir; they all share the one instance dir
 versiondir="$cachedir/versions/$version"
 gamejson="$versiondir/$version.json"
 mkdir -p "$versiondir" "$gamedir"
-if ! [ -f "$gamejson" ]; then
-  curl -fsSL -o "$gamejson.new" "$gamejsonurl" || { rm -f "$gamejson.new"; echo "minecell: version json download failed" >&2; exit 1; }
-  wantsha1="$(jq -er --arg v "$version" '.versions[] | select(.id == $v) | .sha1' "$manifest")"
-  if [ "$(sha1sum < "$gamejson.new" | cut -d' ' -f1)" != "$wantsha1" ]; then
-    rm -f "$gamejson.new"; echo "minecell: version json sha1 mismatch" >&2; exit 1
+# fetchjson VER: make sure versions/VER/VER.json exists, downloading it from the manifest if not
+fetchjson() {
+  local v="$1" f="$cachedir/versions/$1/$1.json" u sha
+  [ -f "$f" ] && return 0
+  mkdir -p "$(dirname "$f")"
+  u="$(jq -er --arg v "$v" '.versions[] | select(.id == $v) | .url' "$manifest")" \
+    || { echo "minecell: $v is not in the manifest and has no local json" >&2; return 1; }
+  sha="$(jq -er --arg v "$v" '.versions[] | select(.id == $v) | .sha1' "$manifest")"
+  curl -fsSL -o "$f.new" "$u" || { rm -f "$f.new"; echo "minecell: version json download failed" >&2; return 1; }
+  if [ "$(sha1sum < "$f.new" | cut -d' ' -f1)" != "$sha" ]; then
+    rm -f "$f.new"; echo "minecell: version json sha1 mismatch" >&2; return 1
   fi
-  mv "$gamejson.new" "$gamejson"
+  mv "$f.new" "$f"
+}
+fetchjson "$version" || exit 1
+# a profile like fabric's only has what it changes and points at a vanilla version with inheritsFrom:
+# merge the two (the profile wins, libraries and arguments are added together) and use the parent's jar
+jarver="$version"
+parent="$(jq -r '.inheritsFrom // empty' "$gamejson")"
+if [ -n "$parent" ]; then
+  case "$parent" in */*) echo "minecell: bad inheritsFrom: $parent" >&2; exit 1 ;; esac
+  fetchjson "$parent" || exit 1
+  jarver="$parent"
+  merged="$tmpdir/merged.json"
+  jq -s '.[0] as $p | .[1] as $c | ($p * $c) + {
+      libraries: (($c.libraries // []) + ($p.libraries // [])),
+      arguments: {jvm: (($p.arguments.jvm // []) + ($c.arguments.jvm // [])),
+                  game: (($p.arguments.game // []) + ($c.arguments.game // []))}}' \
+    "$cachedir/versions/$parent/$parent.json" "$gamejson" > "$merged" \
+    || { echo "minecell: could not merge $version with $parent" >&2; exit 1; }
+  gamejson="$merged"
 fi
 getj() { jq -er "$1" "$gamejson" || { echo "minecell: $gamejson has no $1" >&2; exit 1; }; }
 mainclass="$(getj .mainClass)" || exit 1
@@ -237,22 +264,29 @@ assetsurl="$(getj .assetIndex.url)" || exit 1
 assetssha1="$(getj .assetIndex.sha1)" || exit 1
 # libraries that apply to linux, one per line: path<TAB>url<TAB>sha1
 mapfile -t libs < <(jq -r '.libraries[]
-  | select(.downloads.artifact)
   | select(((.rules // [{"action":"allow"}])
       | map(select((.os.name // "linux") == "linux") | .action) | last) == "allow")
-  | [.downloads.artifact.path, .downloads.artifact.url, .downloads.artifact.sha1] | @tsv' "$gamejson")
+  | (if .downloads.artifact then .downloads.artifact
+     elif .name and .url then
+       (.name | split(":")) as $n
+       | ($n[0] | gsub("\\."; "/") + "/" + $n[1] + "/" + $n[2] + "/" + $n[1] + "-" + $n[2]
+          + (if $n[3] then "-" + $n[3] else "" end) + ".jar") as $p
+       | {path: $p, url: ((.url | if endswith("/") then . else . + "/" end) + $p), sha1: .sha1}
+     else empty end) as $a
+  | [$a.path, $a.url, ($a.sha1 // "")] | @tsv' "$gamejson")
 # plain-string arguments only (the ones with rules come later); ${placeholders} still to be filled in
 mapfile -t jvmargs < <(jq -r '.arguments.jvm[] | strings' "$gamejson")
 mapfile -t gameargs < <(jq -r '.arguments.game[] | strings' "$gamejson")
 # fetch URL FILE SHA1: download to FILE unless it is already there with the right sha1
 fetch() {
-  [ -f "$2" ] && [ "$(sha1sum < "$2" | cut -d' ' -f1)" = "$3" ] && return 0
+  # an empty sha1 (maven-style libraries) means: present is good enough, and nothing to check after
+  if [ -f "$2" ] && { [ -z "$3" ] || [ "$(sha1sum < "$2" | cut -d' ' -f1)" = "$3" ]; }; then return 0; fi
   mkdir -p "$(dirname "$2")"
   curl -fsSL -o "$2.new" "$1" || { rm -f "$2.new"; return 1; }
-  if [ "$(sha1sum < "$2.new" | cut -d' ' -f1)" != "$3" ]; then rm -f "$2.new"; return 1; fi
+  if [ -n "$3" ] && [ "$(sha1sum < "$2.new" | cut -d' ' -f1)" != "$3" ]; then rm -f "$2.new"; return 1; fi
   mv "$2.new" "$2"
 }
-clientjar="$versiondir/$version.jar"
+clientjar="$cachedir/versions/$jarver/$jarver.jar"
 fetch "$clienturl" "$clientjar" "$clientsha1" || { echo "minecell: client download failed" >&2; exit 1; }
 assetsdir="$cachedir/assets"
 assetindex="$assetsdir/indexes/$assetsid.json"
