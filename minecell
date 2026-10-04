@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="3.0.0"
+VERSION="3.1.0"
 tmpdir="$(mktemp -d)"
 cachedir="$HOME/.odd/minecell"
 snapshot="false"
@@ -115,11 +115,31 @@ launches the latest release (or the latest snapshot with -s), or the version giv
                      when mojang can't be reached): the newest x.y or x.y.z is the release, snapshots need -v
   -T, --no-type      with -l -s: print only the version, not its type
       --dry-run      print the java command instead of running it
-  -h, --help         show this help
+  -h, --help         show this help (short options can be combined: -Nsl, -Nv 26.3 -n odd)
       --             pass everything after it to the game
 EOF
 }
-for i in "$@"; do
+# clustered short options (-Nsl, -Nv 26.3, -nodd) are split up the way getopt does it: a letter that takes
+# a value (d n m j S v k) uses the rest of the cluster if there is one, otherwise the next argument
+eargs=(); need=false; past=false
+for a in "$@"; do
+  if $past || $need; then eargs+=("$a"); need=false; continue; fi
+  if [ "$a" = "--" ]; then past=true; eargs+=("$a"); continue; fi
+  if [[ "$a" == -[!-]* ]] && [ "${#a}" -gt 2 ]; then
+    rest="${a:1}"
+    while [ -n "$rest" ]; do
+      c="${rest:0:1}"; rest="${rest:1}"
+      eargs+=("-$c")
+      case "$c" in
+        d|n|m|j|S|v|k)
+          if [ -n "$rest" ]; then eargs+=("$rest"); rest=""; else need=true; fi ;;
+      esac
+    done
+  else
+    eargs+=("$a")
+  fi
+done
+for i in "${eargs[@]}"; do
   if [ "$passthrough" = "true" ]; then
     extra+=("$i")
     continue
@@ -280,8 +300,15 @@ localversions() {
     echo "$id"
   done | sort -rV
 }
-# in no-download mode x.y and x.y.z names are releases and everything else counts as a snapshot
+# in no-download mode x.y and x.y.z names are releases, names with fabric/forge/quilt/modded in them are
+# modded, and everything else counts as a snapshot
 isrelease() { [[ "$1" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; }
+vtype() {
+  case "${1,,}" in
+    *fabric*|*forge*|*quilt*|*modded*) vt=modded ;;
+    *) if isrelease "$1"; then vt=release; else vt=snapshot; fi ;;
+  esac
+}
 if $nodl; then
   echo "minecell: no-download mode: nothing will be downloaded, only what is already in $cachedir is used" >&2
 else
@@ -302,8 +329,8 @@ fi
 if $list; then
   if $nodl; then
     localversions | while read -r id; do
-      if isrelease "$id"; then vt=release; else vt=snapshot; fi
-      if ! $snapshot && [ "$vt" = snapshot ]; then continue; fi
+      vtype "$id"
+      if ! $snapshot && [ "$vt" != release ]; then continue; fi
       if $snapshot && ! $notype; then echo "$id $vt"; else echo "$id"; fi
     done >&3
   elif ! $snapshot; then

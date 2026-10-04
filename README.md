@@ -11,18 +11,21 @@ launches the latest release (or the latest snapshot with -s), or the version giv
   -s, --snapshot     launch the latest snapshot instead of the latest release
                      (with -l: include snapshots in the list)
   -v, --version VER  launch this version instead of the latest (see -l)
-  -d, --dir PATH     game directory (default: /home/$USER/.odd/minecell/instance)
-  -n, --name NAME    player name (default: $USER)
+  -d, --dir PATH     game directory (default: /home/odd/.odd/minecell/instance)
+  -n, --name NAME    player name (default: odd)
   -m, --mem SIZE     max heap, e.g. 4G
   -j, --java PATH    java binary (default: java)
   -S, --server HOST  join a server straight away
-      --online-mode  join -S through viaproxy (needs the viaproxy folder in the cache dir, see --proxy-login)
+  -o, --online-mode  log in with a microsoft account (device code login, token kept in the cache dir)
+      --fake-online-mode  join -S through viaproxy (needs the viaproxy folder in the cache dir, see --proxy-login)
   -l, --list         list available versions, one per line (releases; add -s for snapshots too, shown as "version type")
   -f, --fabric       run the chosen version with the latest stable fabric loader (downloaded once)
   -k, --skin-of NAME use the skin of this real minecraft account (looks up its uuid)
+  -N, --no-download  download nothing and use only the versions already downloaded (also switched on by itself
+                     when mojang can't be reached): the newest x.y or x.y.z is the release, snapshots need -v
   -T, --no-type      with -l -s: print only the version, not its type
       --dry-run      print the java command instead of running it
-  -h, --help         show this help
+  -h, --help         show this help (short options can be combined: -Nsl, -Nv 26.3 -n odd)
       --             pass everything after it to the game
 ```
 
