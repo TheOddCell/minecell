@@ -49,11 +49,11 @@ username="$(gum input --placeholder="$USER")"
 if [ -z "$username" ] || [ "$username" = "not submitted" ]; then
   args="$args"
 else
-  args="$args -n '$username'"
+  args="$args -n $username"
   clear
   echo "minecell - user - skin"
   if [ "$(gum choose --header='would you like to use the skin accociated with this minecraft account?' yes no)" = "yes" ]; then
-    args="$args -k '$username'"
+    args="$args -k $username"
   fi
 fi
 clear
