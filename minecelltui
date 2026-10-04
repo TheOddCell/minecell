@@ -57,6 +57,7 @@ else
   fi
 fi
 clear
+echo "minecell - config"
 keep="$(gum choose --header='would you like to save this config?' yes no)"
 clear
 tput rmcup
