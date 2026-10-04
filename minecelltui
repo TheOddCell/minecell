@@ -14,7 +14,7 @@ if [ "$type" = "Release" ]; then
   else
     args="$args -v $version"
   fi
-if [ "$type" = "Fabric" ]; then
+elif [ "$type" = "Fabric" ]; then
   clear
   echo "minecell - release (fabric) - pick version"
   version="$(./minecell -l|gum choose)"
@@ -23,7 +23,7 @@ if [ "$type" = "Fabric" ]; then
   else
     args="$args -v $version -f"
   fi
-if [ "$type" = "Snapshot" ]; then
+elif [ "$type" = "Snapshot" ]; then
   clear
   echo "minecell - snapshot - pick version"
   version="$(./minecell -l -s -T|gum choose)"
@@ -32,7 +32,7 @@ if [ "$type" = "Snapshot" ]; then
   else
     args="$args -v $version"
   fi
-if [ "$type" = "Fabric Snapshot" ]; then
+elif [ "$type" = "Fabric Snapshot" ]; then
   clear
   echo "minecell - snapshot (fabric) - pick version"
   version="$(./minecell -l -s -T|gum choose)"
