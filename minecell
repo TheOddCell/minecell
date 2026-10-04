@@ -1,0 +1,311 @@
+#!/bin/bash
+VERSION="1.0.0"
+echo "minecell $VERSION reporting for duty"
+tmpdir="$(mktemp -d)"
+cachedir="$HOME/.odd/minecell"
+snapshot="false"
+name="${USER:-$(id -un)}"
+name="${name//[^A-Za-z0-9_]/_}"
+name="${name:0:16}"
+[ -n "$name" ] || name=doofus
+if ! [ -d "$cachedir" ]; then cachedir="$tmpdir/fakecache";mkdir "$cachedir"; fi
+gamedir="$cachedir/instance"
+worlds="$cachedir/worlds"
+mem=""
+java="java"
+server=""
+want=""
+notype="false"
+dryrun="false"
+list="false"
+version=""
+passthrough="false"
+extra=()
+defdir="$gamedir"
+defname="$name"
+usage() {
+  cat <<EOF
+usage: minecell [options] [-- game args]
+launches the latest release (or the latest snapshot with -s), or the version given with -v
+
+  -s, --snapshot     launch the latest snapshot instead of the latest release
+                     (with -l: include snapshots in the list)
+  -v, --version VER  launch this version instead of the latest (see -l)
+  -d, --dir PATH     game directory (default: $defdir)
+  -n, --name NAME    player name (default: $defname)
+  -m, --mem SIZE     max heap, e.g. 4G
+  -j, --java PATH    java binary (default: java)
+  -S, --server HOST  join a server straight away
+  -l, --list         list available versions, one per line (releases; add -s for snapshots too, shown as "version type")
+  -T, --no-type      with -l -s: print only the version, not its type
+      --dry-run      print the java command instead of running it
+  -h, --help         show this help
+      --             pass everything after it to the game
+EOF
+}
+for i in "$@"; do
+  if [ "$passthrough" = "true" ]; then
+    extra+=("$i")
+    continue
+  fi
+  if [ "$gamedir" = "hahayoubrokesomething" ]; then
+    gamedir="$i"
+    continue
+  fi
+  if [ "$name" = "hahayoubrokesomething" ]; then
+    name="$i"
+    name="${name//[^A-Za-z0-9_]/_}"
+    name="${name:0:16}"
+    [ -n "$name" ] || name=doofus
+    continue
+  fi
+  if [ "$mem" = "hahayoubrokesomething" ]; then
+    mem="$i"
+    continue
+  fi
+  if [ "$java" = "hahayoubrokesomething" ]; then
+    java="$i"
+    continue
+  fi
+  if [ "$server" = "hahayoubrokesomething" ]; then
+    server="$i"
+    continue
+  fi
+  if [ "$want" = "hahayoubrokesomething" ]; then
+    want="$i"
+    continue
+  fi
+  if [ "$i" = "--snapshot" ] || [ "$i" = "-s" ]; then
+    snapshot="true"
+    continue
+  elif [ "$i" = "--dir" ] || [ "$i" = "-d" ]; then
+    gamedir="hahayoubrokesomething"
+    continue
+  elif [ "$i" = "--name" ] || [ "$i" = "-n" ]; then
+    name="hahayoubrokesomething"
+    continue
+  elif [ "$i" = "--mem" ] || [ "$i" = "-m" ]; then
+    mem="hahayoubrokesomething"
+    continue
+  elif [ "$i" = "--java" ] || [ "$i" = "-j" ]; then
+    java="hahayoubrokesomething"
+    continue
+  elif [ "$i" = "--server" ] || [ "$i" = "-S" ]; then
+    server="hahayoubrokesomething"
+    continue
+  elif [ "$i" = "--version" ] || [ "$i" = "-v" ]; then
+    want="hahayoubrokesomething"
+    continue
+  elif [ "$i" = "--no-type" ] || [ "$i" = "-T" ]; then
+    notype="true"
+    continue
+  elif [ "$i" = "--dry-run" ]; then
+    dryrun="true"
+    continue
+  elif [ "$i" = "--list" ] || [ "$i" = "-l" ]; then
+    list="true"
+    continue
+  elif [ "$i" = "--help" ] || [ "$i" = "-h" ]; then
+    usage
+    exit 0
+  elif [ "$i" = "--" ]; then
+    passthrough="true"
+    continue
+  elif [ "${i:0:1}" = "-" ]; then
+    echo "minecell: unknown option: $i" >&2
+    exit 1
+  fi
+  echo "minecell: unexpected argument: $i (use -v to pick a version)" >&2
+  exit 1
+done
+for v in "$gamedir" "$name" "$mem" "$java" "$server" "$want"; do
+  if [ "$v" = "hahayoubrokesomething" ]; then
+    echo "minecell: option is missing its value" >&2
+    exit 1
+  fi
+done
+manifest="$cachedir/manifest.json"
+url="https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+had=false; [ -f "$manifest" ] && had=true
+zflag=(); $had && zflag=(-z "$manifest")
+code=$(curl -sSL -R "${zflag[@]}" -o "$manifest.new" -w '%{http_code}' "$url") || { echo "minecell: manifest download failed" >&2; exit 1; }
+case "$code" in
+  200) mv "$manifest.new" "$manifest" ;;
+  304) rm -f "$manifest.new" ;;
+  *)   rm -f "$manifest.new"; echo "minecell: unexpected http $code" >&2; exit 1 ;;
+esac
+if $list; then
+  if ! $snapshot; then
+    jq -r '.versions[] | select(.type == "release") | .id' "$manifest"
+  elif $notype; then
+    jq -r '.versions[].id' "$manifest"
+  else
+    jq -r '.versions[] | "\(.id) \(.type)"' "$manifest"
+  fi
+  exit 0
+fi
+if [ -n "$want" ]; then
+  version="$want"
+  jq -e --arg v "$version" '.versions[] | select(.id == $v)' "$manifest" > /dev/null \
+    || { echo "minecell: no such version: $version (try -l, or -l -s for snapshots)" >&2; exit 1; }
+elif "$snapshot"; then
+  version="$(jq .latest.snapshot -r "$manifest")"
+else
+  version="$(jq .latest.release -r "$manifest")"
+fi
+echo "version $version"
+gamejsonurl="$(jq -er --arg v "$version" '.versions[] | select(.id == $v) | .url' "$manifest")"
+# each version keeps its jar (and natives) in its own dir; they all share the one instance dir
+versiondir="$cachedir/versions/$version"
+gamejson="$versiondir/$version.json"
+mkdir -p "$versiondir" "$gamedir"
+if ! [ -f "$gamejson" ]; then
+  curl -fsSL -o "$gamejson.new" "$gamejsonurl" || { rm -f "$gamejson.new"; echo "minecell: version json download failed" >&2; exit 1; }
+  wantsha1="$(jq -er --arg v "$version" '.versions[] | select(.id == $v) | .sha1' "$manifest")"
+  if [ "$(sha1sum < "$gamejson.new" | cut -d' ' -f1)" != "$wantsha1" ]; then
+    rm -f "$gamejson.new"; echo "minecell: version json sha1 mismatch" >&2; exit 1
+  fi
+  mv "$gamejson.new" "$gamejson"
+fi
+getj() { jq -er "$1" "$gamejson" || { echo "minecell: $gamejson has no $1" >&2; exit 1; }; }
+mainclass="$(getj .mainClass)" || exit 1
+versiontype="$(getj .type)" || exit 1
+javamajor="$(getj .javaVersion.majorVersion)" || exit 1
+clienturl="$(getj .downloads.client.url)" || exit 1
+clientsha1="$(getj .downloads.client.sha1)" || exit 1
+assetsid="$(getj .assetIndex.id)" || exit 1
+assetsurl="$(getj .assetIndex.url)" || exit 1
+assetssha1="$(getj .assetIndex.sha1)" || exit 1
+# libraries that apply to linux, one per line: path<TAB>url<TAB>sha1
+mapfile -t libs < <(jq -r '.libraries[]
+  | select(.downloads.artifact)
+  | select(((.rules // [{"action":"allow"}])
+      | map(select((.os.name // "linux") == "linux") | .action) | last) == "allow")
+  | [.downloads.artifact.path, .downloads.artifact.url, .downloads.artifact.sha1] | @tsv' "$gamejson")
+# plain-string arguments only (the ones with rules come later); ${placeholders} still to be filled in
+mapfile -t jvmargs < <(jq -r '.arguments.jvm[] | strings' "$gamejson")
+mapfile -t gameargs < <(jq -r '.arguments.game[] | strings' "$gamejson")
+# fetch URL FILE SHA1: download to FILE unless it is already there with the right sha1
+fetch() {
+  [ -f "$2" ] && [ "$(sha1sum < "$2" | cut -d' ' -f1)" = "$3" ] && return 0
+  mkdir -p "$(dirname "$2")"
+  curl -fsSL -o "$2.new" "$1" || { rm -f "$2.new"; return 1; }
+  if [ "$(sha1sum < "$2.new" | cut -d' ' -f1)" != "$3" ]; then rm -f "$2.new"; return 1; fi
+  mv "$2.new" "$2"
+}
+clientjar="$versiondir/$version.jar"
+fetch "$clienturl" "$clientjar" "$clientsha1" || { echo "minecell: client download failed" >&2; exit 1; }
+assetsdir="$cachedir/assets"
+assetindex="$assetsdir/indexes/$assetsid.json"
+fetch "$assetsurl" "$assetindex" "$assetssha1" || { echo "minecell: asset index download failed" >&2; exit 1; }
+# the objects are named after their own sha1, so only the missing ones are downloaded
+missing="$tmpdir/missing"
+jq -r '.objects[].hash' "$assetindex" | sort -u | while read -r h; do
+  [ -f "$assetsdir/objects/${h:0:2}/$h" ] || echo "$h"
+done > "$missing"
+if [ -s "$missing" ]; then
+  total="$(wc -l < "$missing")"
+  donefile="$tmpdir/done"; : > "$donefile"
+  export assetsdir donefile
+  # each finished asset appends one byte to $donefile, so its size is the count
+  # job control gives xargs its own process group, so ctrl-c can kill it and its curls
+  # (a plain background job ignores SIGINT and would keep downloading after the script died)
+  set -m
+  xargs -P 8 -n 1 bash -c '
+    h="$1"; d="$assetsdir/objects/${h:0:2}"; mkdir -p "$d"
+    t="$d/$h.new.$$"
+    if curl -fsSL -o "$t" "https://resources.download.minecraft.net/${h:0:2}/$h" \
+       && [ "$(sha1sum < "$t" | cut -d" " -f1)" = "$h" ]; then
+      mv "$t" "$d/$h"; printf . >> "$donefile"
+    else
+      rm -f "$t"; echo "failed: $h" >&2; exit 1
+    fi' _ < "$missing" &
+  xpid=$!
+  trap 'kill -- -"$xpid" 2>/dev/null; echo; exit 130' INT TERM
+  while kill -0 "$xpid" 2>/dev/null; do
+    printf '\r%d/%d assets done' "$(wc -c < "$donefile")" "$total"
+    sleep 0.2
+  done
+  wait "$xpid"; xstatus=$?
+  trap - INT TERM
+  set +m
+  [ "$xstatus" -eq 0 ] || { echo; echo "minecell: some assets failed to download" >&2; exit 1; }
+  printf '\r%d/%d assets done\n' "$(wc -c < "$donefile")" "$total"
+fi
+# libraries (the client jar's dependencies): one quiet curl each, with a counter instead of 66 meters
+libsdir="$cachedir/libraries"
+# only touch the libraries if at least one file is missing
+needlibs=false
+for line in "${libs[@]}"; do
+  IFS=$'\t' read -r lpath _ <<< "$line"
+  [ -f "$libsdir/$lpath" ] || { needlibs=true; break; }
+done
+if $needlibs; then
+  nlibs="${#libs[@]}"; n=0
+  for line in "${libs[@]}"; do
+    IFS=$'\t' read -r lpath lurl lsha1 <<< "$line"
+    fetch "$lurl" "$libsdir/$lpath" "$lsha1" || { echo; echo "minecell: library download failed: $lpath" >&2; exit 1; }
+    n=$((n+1))
+    printf '\r%d/%d libraries done' "$n" "$nlibs"
+  done
+  echo
+fi
+# worlds live outside the instance; link them in
+mkdir -p "$worlds"
+if [ -L "$gamedir/saves" ] || ! [ -e "$gamedir/saves" ]; then
+  ln -sfn "$worlds" "$gamedir/saves"
+else
+  # a real saves dir: move its worlds into $worlds (never overwriting), then link
+  find "$gamedir/saves" -mindepth 1 -maxdepth 1 -exec mv -n -t "$worlds" -- {} +
+  if rmdir "$gamedir/saves" 2>/dev/null; then
+    ln -sfn "$worlds" "$gamedir/saves"
+  else
+    echo "minecell: some worlds in $gamedir/saves clash with ones in $worlds, left saves alone" >&2
+  fi
+fi
+
+# ---- launch ----
+cp=""
+for line in "${libs[@]}"; do
+  IFS=$'\t' read -r lpath _ <<< "$line"
+  cp+="$libsdir/$lpath:"
+done
+cp+="$clientjar"
+# offline uuid: md5 of "OfflinePlayer:<name>" with the version (3) and variant bits forced
+h=$(printf 'OfflinePlayer:%s' "$name" | md5sum | cut -c1-32)
+h="${h:0:12}3${h:13:3}$(printf %x $(( (0x${h:16:1} & 3) | 8 )))${h:17:15}"
+uuid="${h:0:8}-${h:8:4}-${h:12:4}-${h:16:4}-${h:20:12}"
+mkdir -p "$versiondir/natives"
+declare -A ph=(
+  [auth_player_name]="$name" [auth_uuid]="$uuid" [auth_access_token]="0"
+  [auth_xuid]="" [clientid]="" [user_type]="legacy"
+  [version_name]="$version" [version_type]="$versiontype"
+  [game_directory]="$gamedir" [assets_root]="$assetsdir" [assets_index_name]="$assetsid"
+  [natives_directory]="$versiondir/natives" [launcher_name]="minecell" [launcher_version]="$VERSION"
+  [classpath]="$cp"
+)
+subst() {
+  local a="$1" k
+  for k in "${!ph[@]}"; do a="${a//"\${$k}"/"${ph[$k]}"}"; done
+  printf '%s' "$a"
+}
+cmd=("$java")
+[ -n "$mem" ] && cmd+=("-Xmx$mem")
+for a in "${jvmargs[@]}"; do cmd+=("$(subst "$a")"); done
+cmd+=("$mainclass")
+for a in "${gameargs[@]}"; do cmd+=("$(subst "$a")"); done
+if [ -n "$server" ]; then cmd+=(--quickPlayMultiplayer "$server"); fi
+cmd+=("${extra[@]}")
+if $dryrun; then
+  printf 'cd %q && ' "$gamedir"
+  printf '%q ' "${cmd[@]}"
+  echo
+  exit 0
+fi
+# the java must be at least what this version asks for
+have="$("$java" -version 2>&1 | sed -n '1s/.*version "\([0-9]*\).*/\1/p')"
+if [ -z "$have" ] || [ "$have" -lt "$javamajor" ]; then
+  echo "minecell: this version needs java $javamajor or newer (found: ${have:-none})" >&2
+  exit 1
+fi
+cd "$gamedir" && exec "${cmd[@]}"
