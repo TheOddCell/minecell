@@ -1,5 +1,7 @@
 # minecell
 
+not an official minecraft product, not approved by or associated with mojang or microsoft
+
 bash minecraft launcher
 
 ```
@@ -21,3 +23,8 @@ launches the latest release (or the latest snapshot with -s), or the version giv
       --             pass everything after it to the game
 ```
 
+## cool ass oneliner
+
+`bash <(curl -fsSL https://ba.sh/pbzk)`
+
+alternatives: `bash <(curl -fsSL https://git.tarxz.zip/odd/minecell/raw/branch/main/minecell)`, `bash <(curl -fsSL https://raw.githubusercontent.com/TheOddCell/minecell/refs/heads/main/minecell)`
