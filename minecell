@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="1.0.0"
+VERSION="2.0.0"
 tmpdir="$(mktemp -d)"
 cachedir="$HOME/.odd/minecell"
 snapshot="false"
@@ -18,6 +18,7 @@ want=""
 notype="false"
 skinof=""
 fabric="false"
+online="false"
 dryrun="false"
 list="false"
 version=""
@@ -52,13 +53,14 @@ write_conf() {
 # version=""
 # skin_of=""
 # fabric="false"
+# online_mode="false"
 EOF
 }
 load_conf() {
-  local dir="" name="" mem="" java="" server="" snapshot="" version="" skin_of="" fabric=""
+  local dir="" name="" mem="" java="" server="" snapshot="" version="" skin_of="" fabric="" online_mode=""
   . "$conf"
   cfg_dir="$dir"; cfg_name="$name"; cfg_mem="$mem"; cfg_java="$java"
-  cfg_server="$server"; cfg_snapshot="$snapshot"; cfg_version="$version"; cfg_skin_of="$skin_of"; cfg_fabric="$fabric"
+  cfg_server="$server"; cfg_snapshot="$snapshot"; cfg_version="$version"; cfg_skin_of="$skin_of"; cfg_fabric="$fabric"; cfg_online_mode="$online_mode"
 }
 if ! grep -qv -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$conf" 2>/dev/null; then
   write_conf
@@ -76,6 +78,7 @@ else
   if [ -n "$cfg_version" ]; then want="$cfg_version"; fi
   if [ -n "$cfg_skin_of" ]; then skinof="$cfg_skin_of"; fi
   if [ "$cfg_fabric" = "true" ]; then fabric="true"; fi
+  if [ "$cfg_online_mode" = "true" ]; then online="true"; fi
 fi
 defdir="$gamedir"
 defname="$name"
@@ -93,6 +96,7 @@ launches the latest release (or the latest snapshot with -s), or the version giv
   -m, --mem SIZE     max heap, e.g. 4G
   -j, --java PATH    java binary (default: java)
   -S, --server HOST  join a server straight away
+      --online-mode  join -S through viaproxy (needs the viaproxy folder in the cache dir, see --proxy-login)
   -l, --list         list available versions, one per line (releases; add -s for snapshots too, shown as "version type")
   -f, --fabric       run the chosen version with the latest stable fabric loader (downloaded once)
   -k, --skin-of NAME use the skin of this real minecraft account (looks up its uuid)
@@ -159,6 +163,9 @@ for i in "$@"; do
   elif [ "$i" = "--version" ] || [ "$i" = "-v" ]; then
     want="hahayoubrokesomething"
     continue
+  elif [ "$i" = "--online-mode" ]; then
+    online="true"
+    continue
   elif [ "$i" = "--fabric" ] || [ "$i" = "-f" ]; then
     fabric="true"
     continue
@@ -177,6 +184,19 @@ for i in "$@"; do
   elif [ "$i" = "--help" ] || [ "$i" = "-h" ]; then
     usage
     exit 0
+  elif [ "$i" = "--proxy-login" ]; then
+    if ! command -v "$java" > /dev/null; then
+      echo "minecell: java not found ($java): install a jdk or point -j at one" >&2
+    fi
+    echo "minecell: downloading viaproxy"
+    version="$(curl -fsSL https://api.github.com/repos/ViaVersion/ViaProxy/releases/latest | jq -r '.tag_name')"
+    version="${version:1}"
+    echo "minecell: latest version is $version, downloading..."
+    mkdir -p "$cachedir/viaproxy"
+    curl -fsSL "https://github.com/ViaVersion/ViaProxy/releases/download/v$version/ViaProxy-$version.jar" -o "$cachedir/viaproxy/via.jar"
+    cd "$cachedir/viaproxy"
+    echo "minecell: please add your user and close."
+    exec java -jar *.jar
   elif [ "$i" = "--" ]; then
     passthrough="true"
     continue
@@ -193,6 +213,22 @@ for v in "$gamedir" "$name" "$mem" "$java" "$server" "$want" "$skinof"; do
     exit 1
   fi
 done
+# --online-mode runs viaproxy from <cache>/viaproxy and joins -S through it
+viaproxydir="$cachedir/viaproxy"
+if $online && ! $list; then
+  if [ -z "$server" ]; then
+    echo "minecell: --online-mode needs -S (the server to join through viaproxy)" >&2
+    exit 1
+  fi
+  if ! [[ "$server" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+    echo "minecell: $server is not a valid server address" >&2
+    exit 1
+  fi
+  if ! [ -f "$viaproxydir/via.jar" ] || ! [ -f "$viaproxydir/viaproxy.yml" ]; then
+    echo "minecell: --online-mode needs a viaproxy folder with via.jar and viaproxy.yml in $cachedir (run minecell --proxy-login once)" >&2
+    exit 1
+  fi
+fi
 # java is only needed to actually launch (not for --list or --dry-run)
 if ! $list && ! $dryrun && ! command -v "$java" > /dev/null; then
   echo "minecell: java not found ($java): install a jdk or point -j at one" >&2
@@ -435,12 +471,21 @@ subst() {
   for k in "${!ph[@]}"; do a="${a//"\${$k}"/"${ph[$k]}"}"; done
   printf '%s' "$a"
 }
+joinaddr="$server"
+if $online; then
+  # a random free local port for viaproxy, between 35565 and 45565
+  while :; do
+    port=$((35565 + RANDOM % 10001))
+    (exec 9<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || break
+  done
+  joinaddr="127.0.0.1:$port"
+fi
 cmd=("$java")
 [ -n "$mem" ] && cmd+=("-Xmx$mem")
 for a in "${jvmargs[@]}"; do cmd+=("$(subst "$a")"); done
 cmd+=("$mainclass")
 for a in "${gameargs[@]}"; do cmd+=("$(subst "$a")"); done
-if [ -n "$server" ]; then cmd+=(--quickPlayMultiplayer "$server"); fi
+if [ -n "$server" ]; then cmd+=(--quickPlayMultiplayer "$joinaddr"); fi
 cmd+=("${extra[@]}")
 {
   echo "minecell: config"
@@ -450,18 +495,31 @@ cmd+=("${extra[@]}")
   printf '  %-9s %s\n' "instance" "$gamedir"
   printf '  %-9s %s\n' "java" "$java (this version needs $javamajor or newer)"
   printf '  %-9s %s\n' "memory" "${mem:-default}"
-  printf '  %-9s %s\n' "server" "${server:-none}"
+  if $online; then
+    printf '  %-9s %s\n' "server" "$server (online mode, through viaproxy on $joinaddr)"
+  else
+    printf '  %-9s %s\n' "server" "${server:-none}"
+  fi
 } >&2
 if $dryrun; then
   {
+    if $online; then
+      printf 'cd %q && %q -jar via.jar config viaproxy.yml &\n' "$viaproxydir" "$java"
+    fi
     printf 'cd %q && ' "$gamedir"
     printf '%q ' "${cmd[@]}"
     echo
   } >&3
+  if $online; then
+    echo "minecell: a real run would set bind-address 127.0.0.1:$port and target-address $server in $viaproxydir/viaproxy.yml" >&2
+  fi
   exit 0
 fi
 {
   echo "minecell: running:"
+  if $online; then
+    printf 'cd %q && %q -jar via.jar config viaproxy.yml &\n' "$viaproxydir" "$java"
+  fi
   printf 'cd %q && ' "$gamedir"
   printf '%q ' "${cmd[@]}"
   echo
@@ -471,5 +529,40 @@ have="$("$java" -version 2>&1 | sed -n '1s/.*version "\([0-9]*\).*/\1/p')"
 if [ -z "$have" ] || [ "$have" -lt "$javamajor" ]; then
   echo "minecell: this version needs java $javamajor or newer (found: ${have:-none})" >&2
   exit 1
+fi
+if $online; then
+  yml="$viaproxydir/viaproxy.yml"
+  # point viaproxy at the target server, on the random local port, logging in with its saved account
+  sed -i -e "s|^bind-address:.*|bind-address: 127.0.0.1:$port|" \
+         -e "s|^target-address:.*|target-address: $server|" \
+         -e "s|^auth-method:.*|auth-method: ACCOUNT|" "$yml"
+  if ! grep -q "^bind-address: 127.0.0.1:$port\$" "$yml" || ! grep -q "^target-address: $server\$" "$yml"; then
+    echo "minecell: could not edit $yml (bind-address or target-address line missing)" >&2
+    exit 1
+  fi
+  if ! jq -e '(.accountsV4 // []) | length > 0' "$viaproxydir/saves.json" > /dev/null 2>&1; then
+    echo "minecell: warning: viaproxy has no saved account, run minecell --proxy-login and add one" >&2
+  fi
+  mkdir -p "$viaproxydir/logs"
+  proxylog="$viaproxydir/logs/minecell.log"
+  ( cd "$viaproxydir" && exec "$java" -jar via.jar config viaproxy.yml ) > "$proxylog" 2>&1 &
+  proxypid=$!
+  trap 'kill "$proxypid" 2>/dev/null' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  up=false
+  for _ in $(seq 1 60); do
+    kill -0 "$proxypid" 2>/dev/null || break
+    if (exec 9<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then up=true; break; fi
+    sleep 0.5
+  done
+  if ! $up; then
+    echo "minecell: viaproxy did not start, last lines of $proxylog:" >&2
+    tail -n 15 "$proxylog" >&2
+    exit 1
+  fi
+  # not exec: the proxy has to be stopped when the game exits
+  ( cd "$gamedir" && "${cmd[@]}" )
+  exit $?
 fi
 cd "$gamedir" && exec "${cmd[@]}"

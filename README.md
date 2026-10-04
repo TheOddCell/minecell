@@ -12,10 +12,11 @@ launches the latest release (or the latest snapshot with -s), or the version giv
                      (with -l: include snapshots in the list)
   -v, --version VER  launch this version instead of the latest (see -l)
   -d, --dir PATH     game directory (default: /home/odd/.odd/minecell/instance)
-  -n, --name NAME    player name (default: odd)
+  -n, --name NAME    player name (default: TheOddCell)
   -m, --mem SIZE     max heap, e.g. 4G
   -j, --java PATH    java binary (default: java)
   -S, --server HOST  join a server straight away
+      --online-mode  join -S through viaproxy (needs the viaproxy folder in the cache dir, see --proxy-login)
   -l, --list         list available versions, one per line (releases; add -s for snapshots too, shown as "version type")
   -f, --fabric       run the chosen version with the latest stable fabric loader (downloaded once)
   -k, --skin-of NAME use the skin of this real minecraft account (looks up its uuid)
