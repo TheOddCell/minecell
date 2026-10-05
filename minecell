@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="3.1.0"
+VERSION="3.2.0"
 tmpdir="$(mktemp -d)"
 cachedir="$HOME/.odd/minecell"
 snapshot="false"
@@ -31,7 +31,7 @@ extra=()
 # dependencies: every external command the script uses, with the package it usually comes from
 missingdeps=()
 for dep in curl:curl jq:jq sed:sed grep:grep sha1sum:coreutils md5sum:coreutils mktemp:coreutils \
-           cut:coreutils date:coreutils chmod:coreutils sort:coreutils wc:coreutils ln:coreutils mv:coreutils mkdir:coreutils \
+           cut:coreutils sha256sum:coreutils date:coreutils chmod:coreutils sort:coreutils wc:coreutils ln:coreutils mv:coreutils mkdir:coreutils \
            dirname:coreutils xargs:findutils find:findutils; do
   command -v "${dep%%:*}" > /dev/null || missingdeps+=("${dep%%:*} (${dep##*:})")
 done
@@ -272,8 +272,9 @@ if $fakeonline && ! $list; then
     exit 1
   fi
 fi
-# java is only needed to actually launch (not for --list or --dry-run)
-if ! $list && ! $dryrun && ! command -v "$java" > /dev/null; then
+# an explicitly chosen java (-j or the config) has to exist; with the default one, minecell settles it later:
+# system java if it is recent enough, else a downloaded one
+if ! $list && ! $dryrun && [ "$java" != "java" ] && ! command -v "$java" > /dev/null; then
   echo "minecell: java not found ($java): install a jdk or point -j at one" >&2
   exit 1
 fi
@@ -448,6 +449,55 @@ clientsha1="$(getj .downloads.client.sha1)" || exit 1
 assetsid="$(getj .assetIndex.id)" || exit 1
 assetsurl="$(getj .assetIndex.url)" || exit 1
 assetssha1="$(getj .assetIndex.sha1)" || exit 1
+
+# ---- which java to run ----
+# -j / the config wins. otherwise: the system java if it is new enough for this version, else the one in
+# <cache>/java/<major>, else download it (eclipse temurin jre from adoptium) unless no-download mode is on
+javamajor_of() { "$1" -version 2>&1 | sed -n '1s/.*version "\([0-9]*\).*/\1/p'; }
+getjava() {
+  local arch os meta link sum dl top
+  command -v tar > /dev/null || { echo "minecell: tar is needed to unpack java" >&2; return 1; }
+  case "$(uname -m)" in
+    x86_64|amd64) arch=x64 ;;
+    aarch64|arm64) arch=aarch64 ;;
+    *) echo "minecell: no automatic java download for $(uname -m), install java $javamajor yourself" >&2; return 1 ;;
+  esac
+  os=linux; if ldd --version 2>&1 | grep -qi musl; then os=alpine-linux; fi
+  meta="$(curl -fsSL "https://api.adoptium.net/v3/assets/latest/$javamajor/hotspot?architecture=$arch&image_type=jre&os=$os&vendor=eclipse")" \
+    || { echo "minecell: could not ask adoptium for java $javamajor" >&2; return 1; }
+  link="$(jq -r '.[0].binary.package.link // empty' <<< "$meta")"
+  sum="$(jq -r '.[0].binary.package.checksum // empty' <<< "$meta")"
+  [ -n "$link" ] && [ -n "$sum" ] || { echo "minecell: adoptium has no java $javamajor jre for $os/$arch" >&2; return 1; }
+  rm -rf "$cachedir"/java/.download.*
+  dl="$cachedir/java/.download.$$"; mkdir -p "$dl"
+  echo "minecell: no suitable java found, downloading java $javamajor (eclipse temurin jre, $(jq -r '.[0].binary.package.size / 1048576 | floor' <<< "$meta") MB)" >&2
+  curl -fL# -o "$dl/jre.tar.gz" "$link" || { rm -rf "$dl"; echo "minecell: java download failed" >&2; return 1; }
+  if [ "$(sha256sum < "$dl/jre.tar.gz" | cut -d' ' -f1)" != "$sum" ]; then
+    rm -rf "$dl"; echo "minecell: java download has the wrong checksum" >&2; return 1
+  fi
+  tar -xzf "$dl/jre.tar.gz" -C "$dl" || { rm -rf "$dl"; echo "minecell: could not unpack java" >&2; return 1; }
+  top="$(find "$dl" -mindepth 1 -maxdepth 1 -type d | head -1)"
+  [ -x "$top/bin/java" ] || { rm -rf "$dl"; echo "minecell: the java download has no bin/java" >&2; return 1; }
+  rm -rf "$cachedir/java/$javamajor"
+  mv "$top" "$cachedir/java/$javamajor" && rm -rf "$dl"
+}
+if [ "$java" = "java" ]; then
+  sysjava=""; command -v java > /dev/null && sysjava="$(javamajor_of java)"
+  if [ -n "$sysjava" ] && [ "$sysjava" -ge "$javamajor" ]; then
+    : # the system java is new enough
+  elif [ -x "$cachedir/java/$javamajor/bin/java" ]; then
+    java="$cachedir/java/$javamajor/bin/java"
+  elif $nodl; then
+    # nothing to download: an old system java is reported by the version check at the end
+    if [ -z "$sysjava" ] && ! $dryrun; then
+      echo "minecell: no java found and no-download mode is on (install java $javamajor or run once without --no-download)" >&2
+      exit 1
+    fi
+  else
+    getjava || exit 1
+    java="$cachedir/java/$javamajor/bin/java"
+  fi
+fi
 # libraries that apply to linux, one per line: path<TAB>url<TAB>sha1
 mapfile -t libs < <(jq -r '.libraries[]
   | select(((.rules // [{"action":"allow"}])
