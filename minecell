@@ -16,11 +16,13 @@ java="java"
 server=""
 want=""
 notype="false"
+loginonly="false"
 skinof=""
 fabric="false"
 online="false"
 fakeonline="false"
 nodl="false"
+verbose="false"
 msclient=""
 mcname=""; mcuuid=""; mctoken=""; usertype="legacy"
 dryrun="false"
@@ -61,13 +63,14 @@ write_conf() {
 # fake_online_mode="false"
 # ms_client_id=""
 # no_download="false"
+# verbose="false"
 EOF
 }
 load_conf() {
-  local dir="" name="" mem="" java="" server="" snapshot="" version="" skin_of="" fabric="" online_mode="" fake_online_mode="" ms_client_id="" no_download=""
+  local dir="" name="" mem="" java="" server="" snapshot="" version="" skin_of="" fabric="" online_mode="" fake_online_mode="" ms_client_id="" no_download="" verbose=""
   . "$conf"
   cfg_dir="$dir"; cfg_name="$name"; cfg_mem="$mem"; cfg_java="$java"
-  cfg_server="$server"; cfg_snapshot="$snapshot"; cfg_version="$version"; cfg_skin_of="$skin_of"; cfg_fabric="$fabric"; cfg_online_mode="$online_mode"; cfg_fake_online_mode="$fake_online_mode"; cfg_ms_client_id="$ms_client_id"; cfg_no_download="$no_download"
+  cfg_server="$server"; cfg_snapshot="$snapshot"; cfg_version="$version"; cfg_skin_of="$skin_of"; cfg_fabric="$fabric"; cfg_online_mode="$online_mode"; cfg_fake_online_mode="$fake_online_mode"; cfg_ms_client_id="$ms_client_id"; cfg_no_download="$no_download"; cfg_verbose="$verbose"
 }
 if ! grep -qv -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$conf" 2>/dev/null; then
   write_conf
@@ -89,11 +92,11 @@ else
   if [ "$cfg_fake_online_mode" = "true" ]; then fakeonline="true"; fi
   if [ -n "$cfg_ms_client_id" ]; then msclient="$cfg_ms_client_id"; fi
   if [ "$cfg_no_download" = "true" ]; then nodl="true"; fi
+  if [ "$cfg_verbose" = "true" ]; then verbose="true"; fi
 fi
 defdir="$gamedir"
 defname="$name"
 usage() {
-  echo "minecell $VERSION reporting for duty"
   cat <<EOF
 usage: minecell [options] [-- game args]
 launches the latest release (or the latest snapshot with -s), or the version given with -v
@@ -114,6 +117,8 @@ launches the latest release (or the latest snapshot with -s), or the version giv
   -N, --no-download  download nothing and use only the versions already downloaded (also switched on by itself
                      when mojang can't be reached): the newest x.y or x.y.z is the release, snapshots need -v
   -T, --no-type      with -l -s: print only the version, not its type
+  -V, --verbose      show the minecraft log and the command it is run with (without it both are hidden)
+      --login-only   log in with a microsoft account (like -o) and stop there, without launching
       --dry-run      print the java command instead of running it
   -h, --help         show this help (short options can be combined: -Nsl, -Nv 26.3 -n odd)
       --             pass everything after it to the game
@@ -211,8 +216,15 @@ for i in "${eargs[@]}"; do
   elif [ "$i" = "--no-download" ] || [ "$i" = "-N" ]; then
     nodl="true"
     continue
+  elif [ "$i" = "--verbose" ] || [ "$i" = "-V" ]; then
+    verbose="true"
+    continue
   elif [ "$i" = "--no-type" ] || [ "$i" = "-T" ]; then
     notype="true"
+    continue
+  elif [ "$i" = "--login-only" ]; then
+    online="true"
+    loginonly="true"
     continue
   elif [ "$i" = "--dry-run" ]; then
     dryrun="true"
@@ -281,6 +293,8 @@ fi
 # fd 3 is the real stdout: in --dry-run everything but the raw command (and -l's list) goes to stderr
 exec 3>&1
 if $dryrun; then exec 1>&2; fi
+# only a real launch is a run of the game: not -l, not --dry-run, not -h
+if ! $list && ! $dryrun; then echo "minecell $VERSION reporting for duty" >&2; fi
 if $fakecache; then
   echo "minecell: warning: ~/.odd/minecell doesn't exist, so this run uses a throwaway cache in $cachedir" >&2
   echo "minecell: nothing is kept (downloads, worlds, instance). run: mkdir ~/.odd/minecell" >&2
@@ -656,7 +670,8 @@ msauth() {
     interval=$(jq -r '.interval // 5' <<< "$resp"); expires=$(jq -r '.expires_in // 900' <<< "$resp")
     echo "minecell: to log in, open $uri and enter the code $user_code" >&2
     canopen=false
-    if command -v xdg-open >/dev/null 2>&1 && [ -r /dev/tty ]; then canopen=true; fi
+    # needs a terminal to read the key from (a launcher without one, like a web front end, just sleeps)
+    if command -v xdg-open >/dev/null 2>&1 && { : < /dev/tty; } 2>/dev/null; then canopen=true; fi
     printf '          alternatively, visit %s?otc=%s' "$uri" "$user_code" >&2
     if $canopen; then printf ', or press o to open it in your browser' >&2; fi
     echo >&2
@@ -719,6 +734,7 @@ offline_uuid() {
 }
 if $online && ! $dryrun; then
   msauth || exit 1
+  if $loginonly; then echo "minecell: logged in as $mcname" >&2; exit 0; fi
   name="$mcname"; uuid="$mcuuid"; usertype="msa"
 elif $online; then
   uuid="00000000-0000-0000-0000-000000000000"; mctoken="<access token>"; usertype="msa"
@@ -807,14 +823,16 @@ if $dryrun; then
   fi
   exit 0
 fi
-{
-  echo "minecell: running:"
-  if $fakeonline; then
-    printf 'cd %q && %q -jar via.jar config viaproxy.yml &\n' "$viaproxydir" "$java"
-  fi
-  printf 'cd %q && ' "$gamedir"
-  showcmd
-} >&2
+if $verbose; then
+  {
+    echo "minecell: running:"
+    if $fakeonline; then
+      printf 'cd %q && %q -jar via.jar config viaproxy.yml &\n' "$viaproxydir" "$java"
+    fi
+    printf 'cd %q && ' "$gamedir"
+    showcmd
+  } >&2
+fi
 # the java must be at least what this version asks for
 have="$("$java" -version 2>&1 | sed -n '1s/.*version "\([0-9]*\).*/\1/p')"
 if [ -z "$have" ] || [ "$have" -lt "$javamajor" ]; then
@@ -853,7 +871,13 @@ if $fakeonline; then
     exit 1
   fi
   # not exec: the proxy has to be stopped when the game exits
-  ( cd "$gamedir" && "${cmd[@]}" )
+  if $verbose; then
+    ( cd "$gamedir" && "${cmd[@]}" )
+  else
+    ( cd "$gamedir" && "${cmd[@]}" ) > /dev/null 2>&1
+  fi
   exit $?
 fi
-cd "$gamedir" && exec "${cmd[@]}"
+cd "$gamedir" || exit 1
+if $verbose; then exec "${cmd[@]}"; fi
+exec "${cmd[@]}" > /dev/null 2>&1

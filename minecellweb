@@ -1,0 +1,861 @@
+#!/usr/bin/env python3
+"""minecellweb: a small web front end for minecell.
+
+Pick a version, log in or set a name, launch the game. A launch is either a regular one (the game opens on this
+machine's own display) or a browser one: this server stops, KasmVNC's Xvnc is started as this user (no service, no
+desktop, nothing but the game) on the same address, the game runs fullscreen in it and you play it in the browser
+with mouse lock; when the game exits the normal page is back.
+
+minecell is looked up in the current directory, then in PATH, and downloaded if neither has it.
+"""
+import argparse
+import base64
+import collections
+import getpass
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "1.0.0"
+AUTH_USER = "minecell"    # the user name that goes with --password (both here and in KasmVNC)
+MINECELL_URL = "https://git.tarxz.zip/odd/minecell/raw/branch/main/minecell"
+# the only three places it can listen: 25565 is minecraft's port, 25580 is it with 80 (http) at the end, and
+# 127.0.255.65 has 255 and 65 in it
+BINDS = {
+    "default": [("127.0.255.65", 80)],
+    "local": [("127.0.0.1", 25580), ("::1", 25580)],
+    "all": [("0.0.0.0", 25580)],
+}
+VERSION_RE = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
+
+
+def die(msg):
+    print("minecellweb: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def say(msg):
+    print("minecellweb: " + msg, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- finding minecell
+
+def find_minecell(explicit, tmpdir):
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            die(f"{explicit} is not an executable file")
+        return os.path.abspath(explicit), "given with --minecell"
+    cur = os.path.join(os.getcwd(), "minecell")
+    if os.path.isfile(cur) and os.access(cur, os.X_OK):
+        return cur, "the current directory"
+    found = shutil.which("minecell")
+    if found:
+        return found, "PATH"
+    say("minecell not found in the current directory or PATH, downloading " + MINECELL_URL)
+    try:
+        # the server turns away python's default user agent
+        req = urllib.request.Request(MINECELL_URL, headers={"User-Agent": "minecellweb/" + VERSION})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read(2_000_000)
+    except Exception as e:
+        die(f"could not download minecell: {e}")
+    if not data.startswith(b"#!"):
+        die("what was downloaded does not look like a script, not using it")
+    dest = os.path.join(tmpdir, "minecell")
+    with open(dest, "wb") as f:
+        f.write(data)
+    os.chmod(dest, 0o755)
+    return dest, "downloaded"
+
+
+# ---------------------------------------------------------------- running the game
+
+class Busy(Exception):
+    pass
+
+
+class Game:
+    """one minecell process at a time, with its output kept for the page"""
+
+    LOGIN_RE = re.compile(r"open (https?://\S+) and enter the code (\S+)")
+    DIRECT_RE = re.compile(r"visit (https?://[^\s,]+)")
+
+    def __init__(self, mc):
+        self.mc = mc
+        self.lock = threading.Lock()
+        self.proc = None
+        self.lines = collections.deque(maxlen=4000)
+        self.total = 0
+        self.login = None
+        self.rc = None
+        self.mode = None
+        self.has_verbose = True    # whether this minecell knows -V (older ones show the game log anyway)
+
+    def add(self, line):
+        if len(line) > 400:
+            line = f"{line[:400]} ... ({len(line)} characters)"
+        with self.lock:
+            self.lines.append(line)
+            self.total += 1
+            m = self.LOGIN_RE.search(line)
+            if m:
+                self.login = {"uri": m.group(1), "code": m.group(2), "direct": None}
+            m = self.DIRECT_RE.search(line)
+            if m and self.login:
+                self.login["direct"] = m.group(1)
+            if line.startswith("minecell: config"):
+                self.login = None
+
+    def running(self):
+        p = self.proc
+        return p is not None and p.poll() is None
+
+    def start(self, args, env, mode):
+        if self.running():
+            raise Busy()
+        self.add("--- minecellweb: minecell " + " ".join(args))
+        self.rc = None
+        self.mode = mode
+        self.login = None
+        proc = subprocess.Popen([self.mc] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, env=env, start_new_session=True,
+                                text=True, errors="replace", bufsize=1)
+        self.proc = proc
+        threading.Thread(target=self._read, args=(proc,), daemon=True).start()
+
+    def _read(self, proc):
+        for line in proc.stdout:
+            self.add(line.rstrip("\n"))
+        proc.wait()
+        self.rc = proc.returncode
+        with self.lock:
+            self.login = None
+        self.add(f"--- exited with code {proc.returncode}")
+
+    def stop(self):
+        """ask the game to quit and, if it hangs, kill it (before this returns: the caller may be about to exit)"""
+        p = self.proc
+        if p is None or p.poll() is not None:
+            return
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
+
+    def state(self, since):
+        with self.lock:
+            total = self.total
+            first = total - len(self.lines)
+            start = max(since, first)
+            lines = list(self.lines)[start - first:]
+            return {"running": self.running(), "mode": self.mode, "rc": self.rc, "login": self.login,
+                    "lines": lines, "next": total}
+
+
+def build_args(o, fullscreen=None, verbose=True, login_only=False):
+    a = ["-V"] if verbose else []
+    ver = o["version"]
+    if ver == "latest-snapshot":
+        a.append("-s")
+    elif ver != "latest":
+        a += ["-v", ver]
+    if o["fabric"]:
+        a.append("-f")
+    if login_only:
+        a.append("--login-only")      # log in (the code shows on the page) and stop, the game starts afterwards
+    elif o["online"]:
+        a.append("-o")
+    if fullscreen:
+        w, h = fullscreen
+        a += ["--", "--fullscreen", "--width", str(w), "--height", str(h)]
+    return a
+
+
+def parse_options(d):
+    """validate what the page sent; returns (options, error)"""
+    if not isinstance(d, dict):
+        return None, "bad request"
+    ver = str(d.get("version") or "latest")
+    if ver not in ("latest", "latest-snapshot") and not VERSION_RE.match(ver):
+        return None, "bad version"
+    return {"version": ver, "fabric": bool(d.get("fabric")), "online": bool(d.get("online"))}, None
+
+
+_vcache = {"t": 0, "data": None}
+
+
+def list_versions(game, refresh):
+    if not refresh and _vcache["data"] is not None and time.time() - _vcache["t"] < 120:
+        return _vcache["data"], None
+    try:
+        r = subprocess.run([game.mc, "-l", "-s"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           errors="replace", timeout=90)
+    except Exception as e:
+        return None, f"could not run minecell: {e}"
+    if r.returncode != 0:
+        return None, "minecell -l failed: " + (r.stderr.strip().splitlines() or ["no message"])[-1]
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if parts:
+            out.append({"id": parts[0], "type": parts[1] if len(parts) > 1 else "release"})
+    _vcache["t"] = time.time()
+    _vcache["data"] = out
+    return out, None
+
+
+# ---------------------------------------------------------------- the page
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>minecellweb</title>
+</head><body>
+<p><select id="version"></select></p>
+<p><label><input type="checkbox" id="snap"> include snapshots</label>
+<label><input type="checkbox" id="fabric"> fabric</label>
+<label><input type="checkbox" id="online"> log in</label></p>
+<p id="vhint"></p>
+
+<div id="login" hidden>
+<p>open <a id="loginlink" target="_blank" rel="noopener">the login page</a> and enter</p>
+<p><b id="logincode"></b></p>
+<p><a id="logindirect" target="_blank" rel="noopener" hidden>open it with the code filled in</a></p>
+</div>
+
+<p><button id="go">Launch</button></p>
+<p id="err"></p>
+
+<pre id="log"></pre>
+
+<script>
+const $=id=>document.getElementById(id);
+let versions=[],next=0,waiting=null;
+const KEY="minecellweb";
+function save(){try{localStorage.setItem(KEY,JSON.stringify({v:$("version").value,s:$("snap").checked,f:$("fabric").checked,o:$("online").checked}))}catch(e){}}
+function load(){try{return JSON.parse(localStorage.getItem(KEY))||{}}catch(e){return {}}}
+async function api(path,body){
+  const r=await fetch(path,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(j.error||r.statusText);
+  return j;
+}
+function fill(keep){
+  const sel=$("version"),snap=$("snap").checked;
+  sel.textContent="";
+  const add=(v,t)=>{const o=document.createElement("option");o.value=v;o.textContent=t;sel.appendChild(o)};
+  add("latest","latest release");
+  if(snap)add("latest-snapshot","latest snapshot");
+  for(const v of versions){
+    if(v.type==="release"||v.type==="modded"||snap)add(v.id,v.type==="release"?v.id:v.id+"  ("+v.type+")");
+  }
+  if([...sel.options].some(o=>o.value===keep))sel.value=keep;
+}
+async function loadVersions(){
+  $("vhint").textContent="loading versions...";
+  try{
+    const j=await api("/api/versions");
+    versions=j.versions;$("vhint").textContent="";
+  }catch(e){$("vhint").textContent="could not list versions: "+e.message}
+  fill(load().v||"latest");
+}
+function view(s){
+  $("go").disabled=s.running||!!waiting;
+  $("login").hidden=!s.login;
+  if(s.login){
+    $("logincode").textContent=s.login.code;
+    $("loginlink").href=s.login.uri;$("loginlink").textContent=s.login.uri;
+    $("logindirect").hidden=!s.login.direct;if(s.login.direct)$("logindirect").href=s.login.direct;
+  }
+  if(s.lines.length)$("log").textContent+=s.lines.join("\n")+"\n";
+  next=s.next;
+  // the login step ended badly: stop waiting for the game screen
+  if(waiting&&!s.running&&s.rc!==null&&s.rc!==0){clearInterval(waiting);waiting=null;$("go").disabled=false}
+}
+async function poll(){
+  try{view(await api("/api/state?since="+next))}catch(e){}
+  setTimeout(poll,1000);
+}
+async function launch(){
+  $("err").textContent="";save();
+  const body={version:$("version").value,fabric:$("fabric").checked,online:$("online").checked};
+  try{
+    await api("/api/launch",body);
+    $("go").disabled=true;
+    waiting=setInterval(async()=>{
+      try{const r=await fetch("/",{cache:"no-store"});const x=await r.text();if(x.includes("KasmVNC")){clearInterval(waiting);location.href="/"}}catch(e){}
+    },700);
+  }catch(e){$("err").textContent=e.message}
+}
+$("go").onclick=launch;
+$("snap").onchange=()=>{fill($("version").value);save()};
+for(const id of ["version","fabric","online"])$(id).addEventListener("change",save);
+const s=load();$("snap").checked=!!s.s;$("fabric").checked=!!s.f;$("online").checked=!!s.o;
+loadVersions();poll();
+</script></body></html>
+"""
+
+
+# ---------------------------------------------------------------- the http server
+
+class Ctx:
+    """what a request handler needs to know"""
+
+    def __init__(self, game, binds):
+        self.game = game
+        self.binds = binds
+        self.check_browser = None     # (options) -> error string or None
+        self.request_browser = None   # callback(options)
+        self.after_login = None       # callback(options): browser mode once the login step has worked
+        self.auth = None              # the expected "Authorization" header, or None when there is no password
+        self.hosts = self._hosts(binds)
+
+    @staticmethod
+    def _hosts(binds):
+        hosts = set()
+        for h, p in binds:
+            name = f"[{h}]" if ":" in h else h
+            hosts.add(name)
+            hosts.add(f"{name}:{p}")
+            if h in ("127.0.0.1", "::1"):
+                hosts.add("localhost")
+                hosts.add(f"localhost:{p}")
+        return hosts
+
+
+def make_handler(ctx):
+    all_hosts = any(h == "0.0.0.0" for h, _ in ctx.binds)
+
+    class H(BaseHTTPRequestHandler):
+        server_version = "minecellweb"
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def send_body(self, code, body, ctype, extra=None):
+            if isinstance(body, str):
+                body = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
+        def send_json(self, code, obj):
+            self.send_body(code, json.dumps(obj), "application/json")
+
+        def send_error_json(self, code, msg):
+            self.send_json(code, {"error": msg})
+
+        def allowed(self):
+            host = self.headers.get("Host", "")
+            if not all_hosts and host not in ctx.hosts:
+                return False
+            origin = self.headers.get("Origin")
+            if origin and origin != "http://" + host:
+                return False
+            return True
+
+        def authorized(self):
+            if ctx.auth is None:
+                return True
+            got = self.headers.get("Authorization", "")
+            return hmac.compare_digest(got.encode(), ctx.auth.encode())
+
+        def deny(self):
+            self.send_body(401, json.dumps({"error": "password needed"}), "application/json",
+                           {"WWW-Authenticate": 'Basic realm="minecellweb", charset="UTF-8"'})
+
+        def do_GET(self):
+            if not self.allowed():
+                return self.send_error_json(403, "bad host or origin")
+            if not self.authorized():
+                return self.deny()
+            path = urllib.parse.urlsplit(self.path).path
+            if path == "/":
+                return self.send_body(200, PAGE, "text/html; charset=utf-8", {
+                    "Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'none'"})
+            if path == "/api/versions":
+                versions, err = list_versions(ctx.game, False)
+                if err:
+                    return self.send_error_json(502, err)
+                return self.send_json(200, {"versions": versions})
+            if path == "/api/state":
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                try:
+                    since = max(0, int(q.get("since", ["0"])[0]))
+                except ValueError:
+                    since = 0
+                return self.send_json(200, ctx.game.state(since))
+            self.send_error_json(404, "not found")
+
+        def do_POST(self):
+            if not self.allowed():
+                return self.send_error_json(403, "bad host or origin")
+            if not self.authorized():
+                return self.deny()
+            if "application/json" not in self.headers.get("Content-Type", ""):
+                return self.send_error_json(415, "json only")
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                n = -1
+            if n < 0 or n > 8192:
+                return self.send_error_json(400, "bad length")
+            try:
+                data = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                return self.send_error_json(400, "bad json")
+            path = urllib.parse.urlsplit(self.path).path
+            if path == "/api/launch":
+                return self.launch(data)
+            self.send_error_json(404, "not found")
+
+        def launch(self, data):
+            opts, err = parse_options(data)
+            if err:
+                return self.send_error_json(400, err)
+            if ctx.game.running():
+                return self.send_error_json(409, "the game is already running")
+            err = ctx.check_browser(opts)
+            if err:
+                return self.send_error_json(400, err)
+            if opts["online"]:
+                # log in first, here (the code shows on this page); the game starts once that has worked
+                try:
+                    ctx.game.start(build_args(opts, verbose=ctx.game.has_verbose, login_only=True),
+                                   os.environ.copy(), "login")
+                except Busy:
+                    return self.send_error_json(409, "minecell is already running")
+                except OSError as e:
+                    return self.send_error_json(500, f"could not start minecell: {e}")
+                self.send_json(200, {"ok": True})
+                ctx.after_login(opts)
+                return
+            self.send_json(200, {"ok": True})
+            ctx.request_browser(opts)
+
+    return H
+
+
+class Srv(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class Srv6(Srv):
+    address_family = socket.AF_INET6
+
+
+def start_servers(binds, handler):
+    servers, errors = [], []
+    for host, port in binds:
+        cls = Srv6 if ":" in host else Srv
+        try:
+            s = cls((host, port), handler)
+        except OSError as e:
+            errors.append((host, port, e))
+            continue
+        threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True).start()
+        servers.append(s)
+    return servers, errors
+
+
+def stop_servers(servers):
+    for s in servers:
+        s.shutdown()
+        s.server_close()
+
+
+def url_of(host, port):
+    h = f"[{host}]" if ":" in host else host
+    return f"http://{h}" + ("" if port == 80 else f":{port}")
+
+
+def bind_or_die(binds, handler):
+    servers, errors = start_servers(binds, handler)
+    for host, port, e in errors:
+        say(f"warning: could not listen on {host}:{port}: {e.strerror}")
+    if not servers:
+        host, port, e = errors[0]
+        hint = ""
+        if port < 1024 and e.errno == 13:
+            hint = "\n  ports below 1024 need root or: sudo sysctl net.ipv4.ip_unprivileged_port_start=80\n  (or use --local / --all, which listen on 25580)"
+        die(f"could not listen on {host}:{port}: {e.strerror}{hint}")
+    return servers
+
+
+# ---------------------------------------------------------------- browser mode (KasmVNC)
+
+KASM_WWW = "/usr/share/kasmvnc/www"
+DRI_NODE = "/dev/dri/renderD128"
+
+
+def kill(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def kasm_problem(opts, drinode=DRI_NODE, password=False):
+    """why browser mode can't run, or None"""
+    if password and not shutil.which("kasmvncpasswd"):
+        return "a password for KasmVNC needs its kasmvncpasswd tool (not found in PATH)"
+    xvnc = shutil.which("Xvnc")
+    if not xvnc:
+        return "browser mode needs KasmVNC installed (its Xvnc was not found in PATH)"
+    try:
+        r = subprocess.run([xvnc, "-version"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+        if "KasmVNC" not in r.stdout + r.stderr:
+            return "the Xvnc in PATH is not KasmVNC's (browser mode needs KasmVNC)"
+    except (OSError, subprocess.SubprocessError):
+        return "could not run Xvnc"
+    if not os.path.isfile(os.path.join(KASM_WWW, "index.html")):
+        return f"KasmVNC's web files were not found in {KASM_WWW}"
+    # KasmVNC's X server has no software opengl (GLX), so the game needs the gpu through hw3d
+    if not os.access(drinode, os.R_OK | os.W_OK):
+        return f"browser mode needs a gpu render node it can use ({drinode} is missing or not accessible)"
+    return None
+
+
+def x_env(display):
+    """the environment for the game: the hidden X server, not the real (wayland) session"""
+    env = os.environ.copy()
+    env.pop("WAYLAND_DISPLAY", None)
+    env.update(DISPLAY=f":{display}", SDL_VIDEODRIVER="x11", XDG_SESSION_TYPE="x11", GDK_BACKEND="x11")
+    return env
+
+
+def kasm_www(tmpdir):
+    """KasmVNC's web files as symlinks, with one setting changed in a copy: its client then scales the screen to
+    the browser window by default, so the game is not cut off in a window that is smaller than the screen.
+    Without the setting (another KasmVNC version) the original folder is used."""
+    dest = os.path.join(tmpdir, "kasm-www")
+    if os.path.isdir(dest):
+        return dest
+    old, new = 'initSetting("resize","remote")', 'initSetting("resize","scale")'
+    patched = False
+    for root, dirs, files in os.walk(KASM_WWW):
+        out = os.path.join(dest, os.path.relpath(root, KASM_WWW))
+        os.makedirs(out, exist_ok=True)
+        for f in files:
+            src, dst = os.path.join(root, f), os.path.join(out, f)
+            if f.endswith(".js") and not patched:
+                try:
+                    with open(src, encoding="utf-8") as fh:
+                        text = fh.read()
+                except (OSError, UnicodeDecodeError):
+                    text = ""
+                if old in text:
+                    with open(dst, "w", encoding="utf-8") as fh:
+                        fh.write(text.replace(old, new))
+                    patched = True
+                    continue
+            os.symlink(src, dst)
+    if not patched:
+        shutil.rmtree(dest, ignore_errors=True)
+        say("warning: could not make KasmVNC's client scale to the window by default, using it as it is")
+        return KASM_WWW
+    return dest
+
+
+def serves_kasm(host, port, auth=None):
+    try:
+        req = urllib.request.Request(f"http://{host}:{port}/", headers={"Authorization": auth} if auth else {})
+        with urllib.request.urlopen(req, timeout=1) as r:
+            return b"KasmVNC" in r.read(4096)
+    except Exception:
+        return False
+
+
+def make_kasm_passwd(tmpdir, password):
+    """a password file for KasmVNC's basic auth with the one user AUTH_USER"""
+    path = os.path.join(tmpdir, "kasmpasswd")
+    if os.path.exists(path):
+        os.unlink(path)
+    r = subprocess.run(["kasmvncpasswd", "-u", AUTH_USER, "-w", "-o", path], input=f"{password}\n{password}\n",
+                       capture_output=True, text=True, timeout=15)
+    if r.returncode != 0 or not os.path.exists(path):
+        raise RuntimeError("kasmvncpasswd failed: " + ((r.stderr or r.stdout).strip().splitlines() or ["no output"])[-1])
+    os.chmod(path, 0o600)
+    return path
+
+
+def start_kasm(host, port, size, drinode, www, logpath, passwd=None, auth=None):
+    """KasmVNC's Xvnc, run directly as this user (no vncserver wrapper, no service, no desktop): an X server that
+    also serves the web client on host:port. Returns (process, display number)."""
+    probe = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    for n in range(90, 130):
+        if os.path.exists(f"/tmp/.X{n}-lock") or os.path.exists(f"/tmp/.X11-unix/X{n}"):
+            continue
+        args = ["Xvnc", f":{n}", "-geometry", f"{size[0]}x{size[1]}", "-depth", "24",
+                "-interface", host, "-websocketPort", str(port), "-httpd", www,
+                "-sslOnly=0", "-SecurityTypes", "None",
+                "-ForceGameMode", "-AlwaysShared", "-publicIP", "127.0.0.1", "-nolisten", "tcp",
+                "-hw3d", "-drinode", drinode, "-AcceptSetDesktopSize=0",
+                *(["-KasmPasswordFile", passwd] if passwd else ["-DisableBasicAuth"]),
+                "-http-header", "Cross-Origin-Embedder-Policy=require-corp",
+                "-http-header", "Cross-Origin-Opener-Policy=same-origin"]
+        with open(logpath, "ab") as log:
+            log.write(f"--- starting {' '.join(args)}\n".encode())
+            p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        for _ in range(150):
+            if p.poll() is not None:
+                break
+            if os.path.exists(f"/tmp/.X11-unix/X{n}") and serves_kasm(probe, port, auth):
+                return p, n
+            time.sleep(0.1)
+        tail = ""
+        try:
+            with open(logpath, "rb") as f:
+                tail = f.read()[-1500:].decode(errors="replace")
+        except OSError:
+            pass
+        kill(p)
+        if "already active" in tail or "lock" in tail.lower():
+            continue          # that display number was taken a moment ago, try the next
+        lines = [l for l in tail.splitlines() if l.strip()]
+        raise RuntimeError("KasmVNC did not start: " + (lines[-1].strip() if lines else "no output"))
+    raise RuntimeError("no free X display number")
+
+
+class Relay:
+    """forwards a listening address to another one (KasmVNC listens on one address only, --local wants two)"""
+
+    def __init__(self, listen, target):
+        self.target = target
+        self.socks = set()
+        self.lock = threading.Lock()
+        fam = socket.AF_INET6 if ":" in listen[0] else socket.AF_INET
+        self.srv = socket.socket(fam, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(listen)
+        self.srv.listen(16)
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._pipe, args=(c,), daemon=True).start()
+
+    def _pipe(self, c):
+        try:
+            u = socket.create_connection(self.target, timeout=5)
+            u.settimeout(None)
+        except OSError:
+            c.close()
+            return
+        with self.lock:
+            self.socks.update((c, u))
+
+        def copy(a, b):
+            try:
+                while True:
+                    d = a.recv(65536)
+                    if not d:
+                        break
+                    b.sendall(d)
+            except OSError:
+                pass
+            finally:
+                for s in (a, b):
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+        threading.Thread(target=copy, args=(u, c), daemon=True).start()
+        copy(c, u)
+        c.close()
+        u.close()
+        with self.lock:
+            self.socks.discard(c)
+            self.socks.discard(u)
+
+    def close(self):
+        # shutdown wakes the thread blocked in accept(), without it the port stays taken after close()
+        for f in (lambda: self.srv.shutdown(socket.SHUT_RDWR), self.srv.close):
+            try:
+                f()
+            except OSError:
+                pass
+        with self.lock:
+            socks = list(self.socks)
+        for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def run_browser(game, binds, opts, size, drinode, tmpdir, password=None, auth=None):
+    """the control page stops; KasmVNC (a hidden X server with the web client) takes the same address, the game
+    runs fullscreen in it, and when the game exits everything is torn down"""
+    xvnc = None
+    relays = []
+    try:
+        host, port = binds[0]
+        passwd = make_kasm_passwd(tmpdir, password) if password else None
+        xvnc, display = start_kasm(host, port, size, drinode, kasm_www(tmpdir), os.path.join(tmpdir, "kasmvnc.log"),
+                                   passwd, auth)
+        for h, p in binds[1:]:
+            relays.append(Relay((h, p), ("127.0.0.1" if host in ("0.0.0.0", "") else host, port)))
+        say(f"browser mode: KasmVNC on display :{display} ({size[0]}x{size[1]}, gpu {drinode})")
+        for h, p in binds:
+            say("open " + url_of(h, p))
+        game.start(build_args(opts, size, game.has_verbose), x_env(display), "browser")
+        while game.running():
+            time.sleep(0.3)
+        say("the game exited, going back to the normal page")
+    finally:
+        for r in relays:
+            r.close()
+        game.stop()
+        kill(xvnc)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="minecellweb", description="a web front end for minecell")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("-a", "--all", action="store_true", help="listen on 0.0.0.0:25580 (everyone on the network can use it)")
+    g.add_argument("-l", "--local", action="store_true", help="listen on 127.0.0.1:25580 and [::1]:25580")
+    ap.add_argument("--minecell", metavar="PATH", help="use this minecell instead of looking in ./ and PATH")
+    ap.add_argument("--size", default="1920x1080", metavar="WxH", help="screen size in browser mode (default 1920x1080)")
+    ap.add_argument("--drinode", default=DRI_NODE, metavar="PATH",
+                    help="browser mode: the gpu render node KasmVNC gives the game (default " + DRI_NODE + ")")
+    pw = ap.add_mutually_exclusive_group()
+    pw.add_argument("-p", "--password", nargs="?", const="", default=None, metavar="PASSWORD",
+                    help=f"ask for a password (user name {AUTH_USER}) on the page and on KasmVNC: a random one is made "
+                         "and shown at start, or give your own")
+    pw.add_argument("-P", "--ask-password", action="store_true",
+                    help="same, but type the password in when asked (it stays out of your shell history and process list)")
+    ap.add_argument("--version", action="version", version="minecellweb " + VERSION)
+    args = ap.parse_args()
+    if not re.fullmatch(r"\d{3,5}x\d{3,5}", args.size):
+        die("--size must look like 1920x1080")
+    size = tuple(int(x) for x in args.size.split("x"))
+    binds = BINDS["all" if args.all else "local" if args.local else "default"]
+
+    def on_term(sig, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_term)   # so a kill cleans up the temp dir and the hidden X server
+
+    password = None
+    if args.ask_password:
+        try:
+            password = getpass.getpass(f"minecellweb: password (user name {AUTH_USER}): ")
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            die("no password given")
+        if not password:
+            die("an empty password is no password")
+        if any(c in password for c in "\r\n\0"):
+            die("the password can't have a line break in it")
+    elif args.password is not None:
+        password = args.password or secrets.token_urlsafe(12)
+        if any(c in password for c in "\r\n\0"):
+            die("the password can't have a line break in it")
+    auth = None
+    if password:
+        auth = "Basic " + base64.b64encode(f"{AUTH_USER}:{password}".encode()).decode()
+
+    tmpdir = tempfile.mkdtemp(prefix="minecellweb.")
+    mc, where = find_minecell(args.minecell, tmpdir)
+    say(f"using {mc} (from {where})")
+    if password:
+        say(f"user name {AUTH_USER}, password " + (password if args.password == "" else "(the one you gave)"))
+        if args.all:
+            say("note: the password is sent over plain http, so anyone who can watch your network can read it")
+    if args.all:
+        say("warning: listening on every interface, anyone who can reach this port can launch the game and, in browser mode, see and use it")
+
+    game = Game(mc)
+    try:
+        h = subprocess.run([mc, "-h"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+        game.has_verbose = "--verbose" in h.stdout
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not game.has_verbose:
+        say("this minecell is older and has no -V/--verbose, so it is not used (the game log is shown anyway)")
+
+    pending = {"opts": None}
+    wake = threading.Event()
+
+    def request_browser(opts):
+        pending["opts"] = opts
+        wake.set()
+
+    def after_login(opts):
+        def wait():
+            while game.rc is None:
+                time.sleep(0.2)
+            if game.rc == 0:
+                request_browser(opts)
+        threading.Thread(target=wait, daemon=True).start()
+
+    try:
+        while True:
+            ctx = Ctx(game, binds)
+            ctx.check_browser = lambda opts: kasm_problem(opts, args.drinode, bool(password))
+            ctx.auth = auth
+            ctx.request_browser = request_browser
+            ctx.after_login = after_login
+            servers = bind_or_die(binds, make_handler(ctx))
+            for srv in servers:
+                say("listening on " + url_of(*srv.server_address[:2]))
+            wake.wait()
+            wake.clear()
+            stop_servers(servers)
+            opts, pending["opts"] = pending["opts"], None
+            try:
+                run_browser(game, binds, opts, size, args.drinode, tmpdir, password, auth)
+            except RuntimeError as e:
+                game.add(f"--- minecellweb: browser mode failed: {e}")
+                say(f"browser mode failed: {e}")
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        say("bye")
+    finally:
+        game.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
