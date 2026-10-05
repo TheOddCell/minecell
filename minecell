@@ -655,15 +655,21 @@ msauth() {
     dev=$(jq -r .device_code <<< "$resp"); uri=$(jq -r '.verification_uri // "https://www.microsoft.com/link"' <<< "$resp")
     interval=$(jq -r '.interval // 5' <<< "$resp"); expires=$(jq -r '.expires_in // 900' <<< "$resp")
     echo "minecell: to log in, open $uri and enter the code $user_code" >&2
-    printf "          alternatively, open $uri?otc=$user_code"
-    if command -v xdg-open >/dev/null 2>&1; then
-      trap "echo;xdg-open $uri?otc=$user_code" TSTP
-      printf " or press ctrl+z to open in your web browser."
-    fi
-    echo
+    canopen=false
+    if command -v xdg-open >/dev/null 2>&1 && [ -r /dev/tty ]; then canopen=true; fi
+    printf '          alternatively, visit %s?otc=%s' "$uri" "$user_code" >&2
+    if $canopen; then printf ', or press o to open it in your browser' >&2; fi
+    echo >&2
     end=$(( $(date +%s) + expires ))
     while [ "$(date +%s)" -lt "$end" ]; do
-      sleep "$interval"
+      if $canopen; then
+        # waits up to $interval for a key; no signals involved, so it also works while a child runs
+        if read -rsn1 -t "$interval" key < /dev/tty && [ "$key" = o ]; then
+          xdg-open "$uri?otc=$user_code" > /dev/null 2>&1 &
+        fi
+      else
+        sleep "$interval"
+      fi
       resp=$(curl -sS -d "client_id=$msclient" -d "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
              --data-urlencode "device_code=$dev" https://login.live.com/oauth20_token.srf)
       ms_access=$(jq -r '.access_token // empty' <<< "$resp")
@@ -671,9 +677,8 @@ msauth() {
         ms_refresh=$(jq -r '.refresh_token // empty' <<< "$resp")
         break; fi
       err=$(jq -r '.error // empty' <<< "$resp")
-      case "$err" in authorization_pending|slow_down|"") ;; *) msfail "microsoft login failed: $err";trap - TSTP return 1 ;; esac
+      case "$err" in authorization_pending|slow_down|"") ;; *) msfail "microsoft login failed: $err"; return 1 ;; esac
     done
-    trap - TSTP
     [ -n "$ms_access" ] || { msfail "the login code expired, run it again"; return 1; }
   fi
   resp=$(mspost https://user.auth.xboxlive.com/user/authenticate "$(jq -n --arg t "$ms_access" \
