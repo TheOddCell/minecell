@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="3.2.0"
+VERSION="3.3.0"
 tmpdir="$(mktemp -d)"
 cachedir="$HOME/.odd/minecell"
 snapshot="false"
@@ -451,7 +451,7 @@ assetsurl="$(getj .assetIndex.url)" || exit 1
 assetssha1="$(getj .assetIndex.sha1)" || exit 1
 
 # ---- which java to run ----
-# -j / the config wins. otherwise: the system java if it is new enough for this version, else the one in
+# -j / the config wins unless it is too old. otherwise: the system java if it is new enough for this version, else the one in
 # <cache>/java/<major>, else download it (eclipse temurin jre from adoptium) unless no-download mode is on
 javamajor_of() { "$1" -version 2>&1 | sed -n '1s/.*version "\([0-9]*\).*/\1/p'; }
 getjava() {
@@ -481,8 +481,17 @@ getjava() {
   rm -rf "$cachedir/java/$javamajor"
   mv "$top" "$cachedir/java/$javamajor" && rm -rf "$dl"
 }
+skipsys=false
+if [ "$java" != "java" ]; then
+  # a java given with -j / the config that is too old (or not java at all) is replaced by minecell's own
+  have="$(javamajor_of "$java" 2>/dev/null)"
+  if [ -z "$have" ] || [ "$have" -lt "$javamajor" ]; then
+    echo "minecell: $java is not java $javamajor or newer (found: ${have:-none}), using minecell's own java instead" >&2
+    java="java"; skipsys=true
+  fi
+fi
 if [ "$java" = "java" ]; then
-  sysjava=""; command -v java > /dev/null && sysjava="$(javamajor_of java)"
+  sysjava=""; $skipsys || { command -v java > /dev/null && sysjava="$(javamajor_of java)"; }
   if [ -n "$sysjava" ] && [ "$sysjava" -ge "$javamajor" ]; then
     : # the system java is new enough
   elif [ -x "$cachedir/java/$javamajor/bin/java" ]; then
@@ -646,16 +655,25 @@ msauth() {
     dev=$(jq -r .device_code <<< "$resp"); uri=$(jq -r '.verification_uri // "https://www.microsoft.com/link"' <<< "$resp")
     interval=$(jq -r '.interval // 5' <<< "$resp"); expires=$(jq -r '.expires_in // 900' <<< "$resp")
     echo "minecell: to log in, open $uri and enter the code $user_code" >&2
+    printf "          alternatively, open $uri?otc=$user_code"
+    if command -v xdg-open >/dev/null 2>&1; then
+      trap "echo;xdg-open $uri?otc=$user_code" TSTP
+      printf " or press ctrl+z to open in your web browser."
+    fi
+    echo
     end=$(( $(date +%s) + expires ))
     while [ "$(date +%s)" -lt "$end" ]; do
       sleep "$interval"
       resp=$(curl -sS -d "client_id=$msclient" -d "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
              --data-urlencode "device_code=$dev" https://login.live.com/oauth20_token.srf)
       ms_access=$(jq -r '.access_token // empty' <<< "$resp")
-      if [ -n "$ms_access" ]; then ms_refresh=$(jq -r '.refresh_token // empty' <<< "$resp"); break; fi
+      if [ -n "$ms_access" ]; then
+        ms_refresh=$(jq -r '.refresh_token // empty' <<< "$resp")
+        break; fi
       err=$(jq -r '.error // empty' <<< "$resp")
-      case "$err" in authorization_pending|slow_down|"") ;; *) msfail "microsoft login failed: $err"; return 1 ;; esac
+      case "$err" in authorization_pending|slow_down|"") ;; *) msfail "microsoft login failed: $err";trap - TSTP return 1 ;; esac
     done
+    trap - TSTP
     [ -n "$ms_access" ] || { msfail "the login code expired, run it again"; return 1; }
   fi
   resp=$(mspost https://user.auth.xboxlive.com/user/authenticate "$(jq -n --arg t "$ms_access" \
