@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="3.3.0"
+VERSION="3.4.0"
 tmpdir="$(mktemp -d)"
 cachedir="$HOME/.odd/minecell"
 snapshot="false"
@@ -10,6 +10,7 @@ name="${name:0:16}"
 fakecache="false"
 if ! [ -d "$cachedir" ]; then cachedir="$tmpdir/fakecache";mkdir "$cachedir"; fakecache="true"; fi
 gamedir="$cachedir/instance"
+base_dir="$gamedir"; base_name="$name"   # the built-in defaults, for the + options (the config file changes the variables)
 worlds="$cachedir/worlds"
 mem=""
 java="java"
@@ -120,6 +121,9 @@ launches the latest release (or the latest snapshot with -s), or the version giv
   -V, --verbose      show the minecraft log and the command it is run with (without it both are hidden)
       --login-only   log in with a microsoft account (like -o) and stop there, without launching
       --dry-run      print the java command instead of running it
+  +X, ++option       the exact opposite of -X/--option, for overriding the config file (the last one given wins):
+                     +s goes back to releases, +o +f +N +T +V +l turn those off, and +d +n +m +j +S +v +k forget
+                     the directory, name, memory, java, server, version or skin set in the config
   -h, --help         show this help (short options can be combined: -Nsl, -Nv 26.3 -n odd)
       --             pass everything after it to the game
 EOF
@@ -140,6 +144,10 @@ for a in "$@"; do
           if [ -n "$rest" ]; then eargs+=("$rest"); rest=""; else need=true; fi ;;
       esac
     done
+  elif [[ "$a" == +[!+]* ]] && [ "${#a}" -gt 2 ]; then
+    # the + options take no value, so +Ns is just +N +s
+    rest="${a:1}"
+    while [ -n "$rest" ]; do eargs+=("+${rest:0:1}"); rest="${rest:1}"; done
   else
     eargs+=("$a")
   fi
@@ -178,6 +186,30 @@ for i in "${eargs[@]}"; do
   fi
   if [ "$skinof" = "hahayoubrokesomething" ]; then
     skinof="$i"
+    continue
+  fi
+  if [ "${i:0:1}" = "+" ]; then
+    # the opposite of the - option: back to the built-in default, whatever the config file said
+    case "$i" in
+      +s|++snapshot) snapshot="false" ;;
+      +v|++version) want="" ;;
+      +d|++dir) gamedir="$base_dir" ;;
+      +n|++name) name="$base_name" ;;
+      +m|++mem) mem="" ;;
+      +j|++java) java="java" ;;
+      +S|++server) server="" ;;
+      +o|++online-mode) online="false"; loginonly="false" ;;
+      ++fake-online-mode) fakeonline="false" ;;
+      +f|++fabric) fabric="false" ;;
+      +k|++skin-of) skinof="" ;;
+      +N|++no-download) nodl="false" ;;
+      +T|++no-type) notype="false" ;;
+      +V|++verbose) verbose="false" ;;
+      +l|++list) list="false" ;;
+      ++login-only) loginonly="false"; online="false" ;;
+      ++dry-run) dryrun="false" ;;
+      *) echo "minecell: unknown option: $i" >&2; exit 1 ;;
+    esac
     continue
   fi
   if [ "$i" = "--snapshot" ] || [ "$i" = "-s" ]; then
