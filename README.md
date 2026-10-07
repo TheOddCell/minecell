@@ -26,12 +26,17 @@ launches the latest release (or the latest snapshot with -s), or the version giv
   -N, --no-download  download nothing and use only the versions already downloaded (also switched on by itself
                      when mojang can't be reached): the newest x.y or x.y.z is the release, snapshots need -v
   -T, --no-type      with -l -s: print only the version, not its type
+  -V, --verbose      show the minecraft log and the command it is run with (without it both are hidden)
+      --login-only   log in with a microsoft account (like -o) and stop there, without launching
       --dry-run      print the java command instead of running it
+  +X, ++option       the exact opposite of -X/--option, for overriding the config file (the last one given wins):
+                     +s goes back to releases, +o +f +N +T +V +l turn those off, and +d +n +m +j +S +v +k forget
+                     the directory, name, memory, java, server, version or skin set in the config
   -h, --help         show this help (short options can be combined: -Nsl, -Nv 26.3 -n odd)
-      --             pass everything after it to the game
+      --             pass everything after it to the game             
 ```
 
-## cool ass oneliner
+## cool oneliner
 
 `bash <(curl -fsSL https://ba.sh/pbzk)`
 
