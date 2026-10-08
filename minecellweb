@@ -90,8 +90,10 @@ class Busy(Exception):
 class Game:
     """one minecell process at a time, with its output kept for the page"""
 
-    LOGIN_RE = re.compile(r"open (https?://\S+) and enter the code (\S+)")
+    LOGIN_RE = re.compile(r"open (https?://\S+) and enter the code (\S+)")   # minecell before 4.0
     DIRECT_RE = re.compile(r"visit (https?://[^\s,]+)")
+    GOTO_RE = re.compile(r"^\s*GOTO (\S+)\s*$")                                # minecell 4.0 and later: "GOTO host/path", then "code XXXX"
+    CODE_RE = re.compile(r"^\s*code (\S+)\s*$")
 
     def __init__(self, mc):
         self.mc = mc
@@ -100,6 +102,7 @@ class Game:
         self.lines = collections.deque(maxlen=4000)
         self.total = 0
         self.login = None
+        self.goto = None
         self.rc = None
         self.mode = None
         self.has_verbose = True    # whether this minecell knows -V (older ones show the game log anyway)
@@ -113,6 +116,15 @@ class Game:
             m = self.LOGIN_RE.search(line)
             if m:
                 self.login = {"uri": m.group(1), "code": m.group(2), "direct": None}
+            m = self.GOTO_RE.search(line)
+            if m:
+                self.goto = m.group(1)
+            else:
+                m = self.CODE_RE.search(line)
+                if m and self.goto:
+                    uri = self.goto if self.goto.startswith("http") else "https://" + self.goto
+                    self.login = {"uri": uri, "code": m.group(1), "direct": None}
+                self.goto = None
             m = self.DIRECT_RE.search(line)
             if m and self.login:
                 self.login["direct"] = m.group(1)

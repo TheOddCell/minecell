@@ -1,5 +1,7 @@
 # minecell
 
+![mincell logo](logo.png)
+
 not an official minecraft product, not approved by or associated with mojang or microsoft
 
 only use if you have purchaced minecraft java or bedrock for pc

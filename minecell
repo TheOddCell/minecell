@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="3.4.0"
+VERSION="4.0.0"
 tmpdir="$(mktemp -d)"
 cachedir="$HOME/.odd/minecell"
 snapshot="false"
@@ -24,7 +24,7 @@ online="false"
 fakeonline="false"
 nodl="false"
 verbose="false"
-msclient=""
+msclient="7b38c1de-c9f4-47f3-904a-eddc7f846f35"
 mcname=""; mcuuid=""; mctoken=""; usertype="legacy"
 dryrun="false"
 list="false"
@@ -62,7 +62,7 @@ write_conf() {
 # fabric="false"
 # online_mode="false"
 # fake_online_mode="false"
-# ms_client_id=""
+# ms_client_id="7b38c1de-c9f4-47f3-904a-eddc7f846f35"
 # no_download="false"
 # verbose="false"
 EOF
@@ -670,14 +670,87 @@ for line in "${libs[@]}"; do
 done
 cp+="$clientjar"
 # ---- microsoft login (-o): device code -> xbox live -> xsts -> minecraft ----
-# the client id is the official launcher's (the same one viaproxy's login uses); set ms_client_id in the
-# config to use your own azure app registration instead
-[ -n "$msclient" ] || msclient="00000000402b5328"
+# the default client id is minecell's own azure app registration, approved by mojang, which uses the v2 endpoint on the
+# consumers tenant. set ms_client_id to another approved app's id to use that instead, or to the official launcher's
+# id (00000000402b5328, the one viaproxy's login uses) to use the old login.live.com endpoint
+if [ "$msclient" = "00000000402b5328" ]; then
+  ms_devicecode_url="https://login.live.com/oauth20_connect.srf"
+  ms_token_url="https://login.live.com/oauth20_token.srf"
+  ms_scope="service::user.auth.xboxlive.com::MBI_SSL"
+  ms_rps="t="
+  ms_devicecode_extra=(-d "response_type=device_code")
+else
+  ms_devicecode_url="https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
+  ms_token_url="https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+  ms_scope="XboxLive.signin offline_access"
+  ms_rps="d="
+  ms_devicecode_extra=()
+  # what "press o" opens: the consent page of the app (the device login itself can't ask for the xbox consent
+  # the first time), which then redirects to the registered localhost uri (see ms_listen_start)
+  ms_open_base="https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_id=$msclient&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A25581%2F&scope=XboxLive.signin%20offline_access&prompt=select_account"
+  ms_open_url="$ms_open_base"
+  ms_ownlink=1
+  ms_pid=""; ms_cap=""; ms_verifier=""; ms_state=""
+fi
 authfile="$cachedir/auth.json"
 mspost() { curl -sS -H 'Content-Type: application/json' -H 'Accept: application/json' -d "$2" "$1"; }
 msfail() { echo "minecell: $*" >&2; return 1; }
+# "press o" opens the consent link of the app, which redirects to the registered localhost uri. python3 catches
+# that redirect and the code in it is traded for a token (pkce), so the link also logs in by itself; typing the
+# device code stays possible meanwhile. without python3 the link only records the consent
+ms_listen_start() {
+  local challenge state
+  command -v python3 >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 || return 0
+  [ -z "$ms_pid" ] || return 0
+  ms_verifier=$(head -c 48 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=')
+  challenge=$(printf %s "$ms_verifier" | openssl dgst -sha256 -binary | base64 -w0 | tr '+/' '-_' | tr -d '=')
+  ms_state=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  ms_open_url="$ms_open_base&code_challenge=$challenge&code_challenge_method=S256&state=$ms_state"
+  ms_cap=$(mktemp)
+  python3 -I - "$ms_cap" > /dev/null 2>&1 <<'PY' &
+import http.server, sys, time, urllib.parse
+out = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        q = urllib.parse.urlparse(self.path).query
+        self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+        if "code=" in q or "error=" in q:
+            self.wfile.write(b"minecell: you can close this tab\n")
+            open(out, "w").write(q); self.server.done = True
+        else:
+            self.wfile.write(b"minecell\n")
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 25581), H); s.done = False; s.timeout = 1
+end = time.time() + 900
+while not s.done and time.time() < end: s.handle_request()
+PY
+  ms_pid=$!
+}
+ms_listen_stop() {
+  [ -z "$ms_pid" ] || { kill "$ms_pid" 2>/dev/null; wait "$ms_pid" 2>/dev/null; }
+  [ -z "$ms_cap" ] || rm -f "$ms_cap"
+  ms_pid=""; ms_cap=""
+}
+# trades the code the listener caught for a token. sets ms_access and ms_refresh, fails quietly if there is none yet
+ms_listen_exchange() {
+  local q code
+  [ -n "$ms_cap" ] && [ -s "$ms_cap" ] || return 1
+  q="&$(cat "$ms_cap")&"; : > "$ms_cap"
+  if [ -n "$(sed -n 's/.*[?&]error=\([^&]*\).*/\1/p' <<< "$q")" ]; then
+    msfail "the consent link reported an error: $(sed -n 's/.*[?&]error_description=\([^&]*\).*/\1/p' <<< "$q" | tr '+' ' ')"; return 1
+  fi
+  [ "$(sed -n 's/.*[?&]state=\([^&]*\).*/\1/p' <<< "$q")" = "$ms_state" ] || return 1
+  code=$(sed -n 's/.*[?&]code=\([^&]*\).*/\1/p' <<< "$q")
+  # the code is still percent-encoded as it came in the redirect, so it is sent as is
+  resp=$(curl -sS -d "client_id=$msclient" -d "grant_type=authorization_code" -d "code=$code" \
+         --data-urlencode "redirect_uri=http://localhost:25581/" -d "code_verifier=$ms_verifier" \
+         --data-urlencode "scope=$ms_scope" "$ms_token_url")
+  ms_access=$(jq -r '.access_token // empty' <<< "$resp")
+  ms_refresh=$(jq -r '.refresh_token // empty' <<< "$resp")
+  [ -n "$ms_access" ] || { msfail "microsoft login failed: $(jq -r '.error_description // .error // "no answer"' <<< "$resp")"; return 1; }
+}
 msauth() {
-  local now rt resp ms_access="" ms_refresh="" dev user_code uri interval expires end err
+  local now rt resp ms_access="" ms_refresh="" dev user_code uri interval expires end last err qr qrw qrurl first disp line
   local xbl xblhash xsts xstshash xerr prof raw mcexp
   now=$(date +%s)
   # a minecraft token that is still valid is used as is
@@ -689,47 +762,63 @@ msauth() {
   rt=""; [ -f "$authfile" ] && rt=$(jq -r '.refresh_token // empty' "$authfile")
   if [ -n "$rt" ]; then
     resp=$(curl -sS -d "client_id=$msclient" -d "grant_type=refresh_token" --data-urlencode "refresh_token=$rt" \
-           -d "scope=service::user.auth.xboxlive.com::MBI_SSL" https://login.live.com/oauth20_token.srf)
+           --data-urlencode "scope=$ms_scope" "$ms_token_url")
     ms_access=$(jq -r '.access_token // empty' <<< "$resp")
     ms_refresh=$(jq -r '.refresh_token // empty' <<< "$resp")
   fi
   if [ -z "$ms_access" ]; then
-    resp=$(curl -sS -d "client_id=$msclient" -d "scope=service::user.auth.xboxlive.com::MBI_SSL" \
-           -d "response_type=device_code" https://login.live.com/oauth20_connect.srf)
+    resp=$(curl -sS -d "client_id=$msclient" --data-urlencode "scope=$ms_scope" \
+           "${ms_devicecode_extra[@]}" "$ms_devicecode_url")
     user_code=$(jq -r '.user_code // empty' <<< "$resp")
     [ -n "$user_code" ] || { msfail "could not start the microsoft login: $(jq -r '.error_description // .error // "no answer"' <<< "$resp")"; return 1; }
     dev=$(jq -r .device_code <<< "$resp"); uri=$(jq -r '.verification_uri // "https://www.microsoft.com/link"' <<< "$resp")
     interval=$(jq -r '.interval // 5' <<< "$resp"); expires=$(jq -r '.expires_in // 900' <<< "$resp")
-    echo "minecell: to log in, open $uri and enter the code $user_code" >&2
     canopen=false
     # needs a terminal to read the key from (a launcher without one, like a web front end, just sleeps)
     if command -v xdg-open >/dev/null 2>&1 && { : < /dev/tty; } 2>/dev/null; then canopen=true; fi
-    printf '          alternatively, visit %s?otc=%s' "$uri" "$user_code" >&2
-    if $canopen; then printf ', or press o to open it in your browser' >&2; fi
-    echo >&2
-    end=$(( $(date +%s) + expires ))
+    # the qr code (when qrencode is installed) comes first, with the text centered under it
+    qr=""; qrw=0
+    if command -v qrencode >/dev/null 2>&1; then
+      # the ?otc= prefill of microsoft.com/link is refused for own apps (invalid_request), so the qr is the plain link
+      qrurl="$uri?otc=$user_code"; [ -z "$ms_open_url" ] || qrurl="$uri"
+      qr=$(qrencode -t UTF8 -m 2 "$qrurl")
+      first=${qr%%$'\n'*}
+      qrw=$(( $(printf %s "$first" | LC_ALL=C wc -c) / 3 ))
+      printf '%s\n' "$qr" >&2
+    fi
+    disp=${uri#https://}; disp=${disp#www.}
+    for line in "GOTO $disp" "code $user_code" "$($canopen && echo 'press o to open')"; do
+      [ -n "$line" ] || continue
+      printf '%*s%s\n' $(( (qrw - ${#line}) / 2 > 0 ? (qrw - ${#line}) / 2 : 0 )) "" "$line" >&2
+    done
+    end=$(( $(date +%s) + expires )); last=$(date +%s)
     while [ "$(date +%s)" -lt "$end" ]; do
       if $canopen; then
-        # waits up to $interval for a key; no signals involved, so it also works while a child runs
-        if read -rsn1 -t "$interval" key < /dev/tty && [ "$key" = o ]; then
-          xdg-open "$uri?otc=$user_code" > /dev/null 2>&1 &
+        # waits up to a second for a key; no signals involved, so it also works while a child runs
+        if read -rsn1 -t 1 key < /dev/tty && [ "$key" = o ]; then
+          [ -z "$ms_ownlink" ] || ms_listen_start
+          xdg-open "${ms_open_url:-$uri?otc=$user_code}" > /dev/null 2>&1 &
         fi
       else
-        sleep "$interval"
+        sleep 1
       fi
+      if ms_listen_exchange; then break; fi
+      [ $(( $(date +%s) - last )) -ge "$interval" ] || continue
+      last=$(date +%s)
       resp=$(curl -sS -d "client_id=$msclient" -d "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
-             --data-urlencode "device_code=$dev" https://login.live.com/oauth20_token.srf)
+             --data-urlencode "device_code=$dev" "$ms_token_url")
       ms_access=$(jq -r '.access_token // empty' <<< "$resp")
       if [ -n "$ms_access" ]; then
         ms_refresh=$(jq -r '.refresh_token // empty' <<< "$resp")
         break; fi
       err=$(jq -r '.error // empty' <<< "$resp")
-      case "$err" in authorization_pending|slow_down|"") ;; *) msfail "microsoft login failed: $err"; return 1 ;; esac
+      case "$err" in authorization_pending|slow_down|"") ;; *) ms_listen_stop; msfail "microsoft login failed: $err"; return 1 ;; esac
     done
+    ms_listen_stop
     [ -n "$ms_access" ] || { msfail "the login code expired, run it again"; return 1; }
   fi
-  resp=$(mspost https://user.auth.xboxlive.com/user/authenticate "$(jq -n --arg t "$ms_access" \
-         '{Properties:{AuthMethod:"RPS",SiteName:"user.auth.xboxlive.com",RpsTicket:("t=" + $t)},RelyingParty:"http://auth.xboxlive.com",TokenType:"JWT"}')")
+  resp=$(mspost https://user.auth.xboxlive.com/user/authenticate "$(jq -n --arg t "$ms_access" --arg p "$ms_rps" \
+         '{Properties:{AuthMethod:"RPS",SiteName:"user.auth.xboxlive.com",RpsTicket:($p + $t)},RelyingParty:"http://auth.xboxlive.com",TokenType:"JWT"}')")
   xbl=$(jq -r '.Token // empty' <<< "$resp")
   [ -n "$xbl" ] || { msfail "xbox live login failed"; return 1; }
   resp=$(mspost https://xsts.auth.xboxlive.com/xsts/authorize "$(jq -n --arg t "$xbl" \
