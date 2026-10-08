@@ -1,6 +1,6 @@
 # minecell
 
-![mincell logo](logo.png)
+<img src="logo.png" alt="minecell logo" width="200">
 
 not an official minecraft product, not approved by or associated with mojang or microsoft
 
