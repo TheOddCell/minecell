@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="4.0.0"
+VERSION="4.1.0"
 tmpdir="$(mktemp -d)"
 cachedir="$HOME/.odd/minecell"
 snapshot="false"
@@ -699,7 +699,7 @@ msfail() { echo "minecell: $*" >&2; return 1; }
 # that redirect and the code in it is traded for a token (pkce), so the link also logs in by itself; typing the
 # device code stays possible meanwhile. without python3 the link only records the consent
 ms_listen_start() {
-  local challenge state
+  local challenge state ms_back
   command -v python3 >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 || return 0
   [ -z "$ms_pid" ] || return 0
   ms_verifier=$(head -c 48 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=')
@@ -707,12 +707,18 @@ ms_listen_start() {
   ms_state=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
   ms_open_url="$ms_open_base&code_challenge=$challenge&code_challenge_method=S256&state=$ms_state"
   ms_cap=$(mktemp)
-  python3 -I - "$ms_cap" > /dev/null 2>&1 <<'PY' &
+  # MINECELL_REDIR: a web front end (minecellweb) is waiting on the other end, the browser goes back to its url
+  ms_back=""; case "${MINECELL_REDIR:-}" in http://*|https://*) ms_back="$MINECELL_REDIR" ;; esac
+  python3 -I - "$ms_cap" "$ms_back" > /dev/null 2>&1 <<'PY' &
 import http.server, sys, time, urllib.parse
-out = sys.argv[1]
+out, back = sys.argv[1], sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         q = urllib.parse.urlparse(self.path).query
+        if ("code=" in q or "error=" in q) and back:
+            self.send_response(302); self.send_header("Location", back); self.send_header("Content-Length", "0"); self.end_headers()
+            open(out, "w").write(q); self.server.done = True
+            return
         self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
         if "code=" in q or "error=" in q:
             self.wfile.write(b"minecell: you can close this tab\n")
@@ -791,6 +797,11 @@ msauth() {
       [ -n "$line" ] || continue
       printf '%*s%s\n' $(( (qrw - ${#line}) / 2 > 0 ? (qrw - ${#line}) / 2 : 0 )) "" "$line" >&2
     done
+    # MINECELL_REDIR: no key to press, the listener starts now and the consent link is printed for the front end
+    if [ -n "${MINECELL_REDIR:-}" ] && [ "$MINECELL_REDIR" != 0 ] && [ -n "$ms_ownlink" ]; then
+      ms_listen_start
+      [ -z "$ms_pid" ] || echo "OPEN $ms_open_url" >&2
+    fi
     end=$(( $(date +%s) + expires )); last=$(date +%s)
     while [ "$(date +%s)" -lt "$end" ]; do
       if $canopen; then

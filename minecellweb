@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 AUTH_USER = "minecell"    # the user name that goes with --password (both here and in KasmVNC)
 MINECELL_URL = "https://git.tarxz.zip/odd/minecell/raw/branch/main/minecell"
 # the only three places it can listen: 25565 is minecraft's port, 25580 is it with 80 (http) at the end, and
@@ -94,6 +94,7 @@ class Game:
     DIRECT_RE = re.compile(r"visit (https?://[^\s,]+)")
     GOTO_RE = re.compile(r"^\s*GOTO (\S+)\s*$")                                # minecell 4.0 and later: "GOTO host/path", then "code XXXX"
     CODE_RE = re.compile(r"^\s*code (\S+)\s*$")
+    OPEN_RE = re.compile(r"^OPEN (https://login\.microsoftonline\.com/\S+)$")   # with MINECELL_REDIR: the consent page "o" would open
 
     def __init__(self, mc):
         self.mc = mc
@@ -103,6 +104,7 @@ class Game:
         self.total = 0
         self.login = None
         self.goto = None
+        self.redir = False         # the page goes to the login by itself and comes back (MINECELL_REDIR=0 turns it off)
         self.rc = None
         self.mode = None
         self.has_verbose = True    # whether this minecell knows -V (older ones show the game log anyway)
@@ -128,6 +130,9 @@ class Game:
             m = self.DIRECT_RE.search(line)
             if m and self.login:
                 self.login["direct"] = m.group(1)
+            m = self.OPEN_RE.search(line)
+            if m and self.login:
+                self.login["open"] = m.group(1)
             if line.startswith("minecell: config"):
                 self.login = None
 
@@ -182,7 +187,7 @@ class Game:
             start = max(since, first)
             lines = list(self.lines)[start - first:]
             return {"running": self.running(), "mode": self.mode, "rc": self.rc, "login": self.login,
-                    "lines": lines, "next": total}
+                    "redir": self.redir, "lines": lines, "next": total}
 
 
 def build_args(o, fullscreen=None, verbose=True, login_only=False):
@@ -263,7 +268,7 @@ PAGE = r"""<!doctype html>
 
 <script>
 const $=id=>document.getElementById(id);
-let versions=[],next=0,waiting=null;
+let versions=[],next=0,waiting=null,kasmWatch=null;
 const KEY="minecellweb";
 function save(){try{localStorage.setItem(KEY,JSON.stringify({v:$("version").value,s:$("snap").checked,f:$("fabric").checked,o:$("online").checked}))}catch(e){}}
 function load(){try{return JSON.parse(localStorage.getItem(KEY))||{}}catch(e){return {}}}
@@ -292,8 +297,30 @@ async function loadVersions(){
   }catch(e){$("vhint").textContent="could not list versions: "+e.message}
   fill(load().v||"latest");
 }
+// the server stops while KasmVNC runs on its address: as soon as that address answers with something that is not
+// this page (KasmVNC's own page, or its login prompt), go there
+function watchKasm(){
+  if(kasmWatch)return;
+  kasmWatch=setInterval(async()=>{
+    try{
+      const r=await fetch("/",{cache:"no-store"});
+      const x=await r.text(),h=(r.headers.get("WWW-Authenticate")||"")+(r.headers.get("Server")||"");
+      if(/kasmvnc/i.test(x+h))location.href="/";
+    }catch(e){}
+  },700);
+}
 function view(s){
+  // MINECELL_REDIR: go to the login page by itself (once per code), it sends the browser back here afterwards
+  if(s.redir&&s.login&&s.login.open&&s.login.open.startsWith("https://login.microsoftonline.com/")){
+    let seen=null;try{seen=sessionStorage.getItem("minecellweb-redir")}catch(e){}
+    if(seen!==s.login.code){
+      try{sessionStorage.setItem("minecellweb-redir",s.login.code)}catch(e){}
+      location.replace(s.login.open);return;
+    }
+  }
   $("go").disabled=s.running||!!waiting;
+  // the login worked: the game screen (KasmVNC) is coming, wait for it
+  if(s.mode==="login"&&s.rc===0)watchKasm();
   $("login").hidden=!s.login;
   if(s.login){
     $("logincode").textContent=s.login.code;
@@ -306,7 +333,7 @@ function view(s){
   if(waiting&&!s.running&&s.rc!==null&&s.rc!==0){clearInterval(waiting);waiting=null;$("go").disabled=false}
 }
 async function poll(){
-  try{view(await api("/api/state?since="+next))}catch(e){}
+  try{view(await api("/api/state?since="+next))}catch(e){watchKasm()}
   setTimeout(poll,1000);
 }
 async function launch(){
@@ -341,6 +368,7 @@ class Ctx:
         self.request_browser = None   # callback(options)
         self.after_login = None       # callback(options): browser mode once the login step has worked
         self.auth = None              # the expected "Authorization" header, or None when there is no password
+        self.redir = None             # MINECELL_REDIR for minecell: where the browser comes back to after the login
         self.hosts = self._hosts(binds)
 
     @staticmethod
@@ -462,9 +490,14 @@ def make_handler(ctx):
                 return self.send_error_json(400, err)
             if opts["online"]:
                 # log in first, here (the code shows on this page); the game starts once that has worked
+                env = os.environ.copy()
+                if ctx.redir:
+                    env["MINECELL_REDIR"] = ctx.redir
+                else:
+                    env.pop("MINECELL_REDIR", None)
                 try:
                     ctx.game.start(build_args(opts, verbose=ctx.game.has_verbose, login_only=True),
-                                   os.environ.copy(), "login")
+                                   env, "login")
                 except Busy:
                     return self.send_error_json(409, "minecell is already running")
                 except OSError as e:
@@ -819,6 +852,16 @@ def main():
         say("warning: listening on every interface, anyone who can reach this port can launch the game and, in browser mode, see and use it")
 
     game = Game(mc)
+    # MINECELL_REDIR is how minecell is told about the front end: it starts its login listener at once, prints the
+    # link the page jumps to and sends the browser back to this address afterwards. minecellweb always sets it
+    # for the minecell it starts; an address in the environment replaces the one worked out here, 0 turns it off
+    redir = os.environ.get("MINECELL_REDIR", "")
+    if redir == "0":
+        redir = ""
+    elif not re.match(r"https?://", redir):
+        rh, rp = binds[0]
+        redir = url_of("127.0.0.1" if rh in ("0.0.0.0", "") else rh, rp) + "/"
+    game.redir = bool(redir)
     try:
         h = subprocess.run([mc, "-h"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
         game.has_verbose = "--verbose" in h.stdout
@@ -847,6 +890,7 @@ def main():
             ctx = Ctx(game, binds)
             ctx.check_browser = lambda opts: kasm_problem(opts, args.drinode, bool(password))
             ctx.auth = auth
+            ctx.redir = redir or None
             ctx.request_browser = request_browser
             ctx.after_login = after_login
             servers = bind_or_die(binds, make_handler(ctx))
