@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="4.1.0"
+VERSION="4.2.0"
 tmpdir="$(mktemp -d)"
 cachedir="$HOME/.odd/minecell"
 snapshot="false"
@@ -10,6 +10,8 @@ name="${name:0:16}"
 fakecache="false"
 if ! [ -d "$cachedir" ]; then cachedir="$tmpdir/fakecache";mkdir "$cachedir"; fakecache="true"; fi
 gamedir="$cachedir/instance"
+# vlog: minecell's own running commentary, shown with -VV (and -VVV)
+vlog() { if [ "$verbose" -ge 2 ]; then echo "minecell: [v] $*" >&2; fi; return 0; }
 base_dir="$gamedir"; base_name="$name"   # the built-in defaults, for the + options (the config file changes the variables)
 worlds="$cachedir/worlds"
 mem=""
@@ -23,7 +25,7 @@ fabric="false"
 online="false"
 fakeonline="false"
 nodl="false"
-verbose="false"
+verbose=0   # -V once: game log + command; twice: minecell's own log too; three times: set -x as well
 msclient="7b38c1de-c9f4-47f3-904a-eddc7f846f35"
 mcname=""; mcuuid=""; mctoken=""; usertype="legacy"
 dryrun="false"
@@ -64,7 +66,7 @@ write_conf() {
 # fake_online_mode="false"
 # ms_client_id="7b38c1de-c9f4-47f3-904a-eddc7f846f35"
 # no_download="false"
-# verbose="false"
+# verbose="false"   # or 1/2/3 for -V/-VV/-VVV
 EOF
 }
 load_conf() {
@@ -93,7 +95,7 @@ else
   if [ "$cfg_fake_online_mode" = "true" ]; then fakeonline="true"; fi
   if [ -n "$cfg_ms_client_id" ]; then msclient="$cfg_ms_client_id"; fi
   if [ "$cfg_no_download" = "true" ]; then nodl="true"; fi
-  if [ "$cfg_verbose" = "true" ]; then verbose="true"; fi
+  case "$cfg_verbose" in true) verbose=1 ;; [0-3]) verbose="$cfg_verbose" ;; esac
 fi
 defdir="$gamedir"
 defname="$name"
@@ -119,10 +121,12 @@ launches the latest release (or the latest snapshot with -s), or the version giv
                      when mojang can't be reached): the newest x.y or x.y.z is the release, snapshots need -v
   -T, --no-type      with -l -s: print only the version, not its type
   -V, --verbose      show the minecraft log and the command it is run with (without it both are hidden)
+                     twice (-VV): also log everything minecell does, e.g. "contacting microsoft api"
+                     three times (-VVV): all of that plus set -x (careful: it shows tokens)
       --login-only   log in with a microsoft account (like -o) and stop there, without launching
       --dry-run      print the java command instead of running it
   +X, ++option       the exact opposite of -X/--option, for overriding the config file (the last one given wins):
-                     +s goes back to releases, +o +f +N +T +V +l turn those off, and +d +n +m +j +S +v +k forget
+                     +s goes back to releases, +o +f +N +T +l turn those off, +V drops all verbosity, and +d +n +m +j +S +v +k forget
                      the directory, name, memory, java, server, version or skin set in the config
   -h, --help         show this help (short options can be combined: -Nsl, -Nv 26.3 -n odd)
       --             pass everything after it to the game
@@ -204,7 +208,7 @@ for i in "${eargs[@]}"; do
       +k|++skin-of) skinof="" ;;
       +N|++no-download) nodl="false" ;;
       +T|++no-type) notype="false" ;;
-      +V|++verbose) verbose="false" ;;
+      +V|++verbose) verbose=0 ;;
       +l|++list) list="false" ;;
       ++login-only) loginonly="false"; online="false" ;;
       ++dry-run) dryrun="false" ;;
@@ -249,7 +253,7 @@ for i in "${eargs[@]}"; do
     nodl="true"
     continue
   elif [ "$i" = "--verbose" ] || [ "$i" = "-V" ]; then
-    verbose="true"
+    [ "$verbose" -ge 3 ] || verbose=$((verbose + 1))
     continue
   elif [ "$i" = "--no-type" ] || [ "$i" = "-T" ]; then
     notype="true"
@@ -296,6 +300,13 @@ for v in "$gamedir" "$name" "$mem" "$java" "$server" "$want" "$skinof"; do
     exit 1
   fi
 done
+if [ "$verbose" -ge 3 ]; then
+  export PS4='+ minecell:${LINENO}: '
+  set -x
+fi
+vlog "version $VERSION, verbosity $verbose, config file $conf, cache dir $cachedir (throwaway: $fakecache)"
+vlog "options: snapshot=$snapshot want=${want:-latest} fabric=$fabric online=$online fakeonline=$fakeonline nodl=$nodl list=$list dryrun=$dryrun loginonly=$loginonly"
+vlog "options: name=$name dir=$gamedir mem=${mem:-default} java=$java server=${server:-none} skinof=${skinof:-none} extra game args: ${#extra[@]}"
 if $online && $fakeonline; then
   echo "minecell: pick one of -o/--online-mode and --fake-online-mode" >&2
   exit 1
@@ -360,20 +371,24 @@ if $nodl; then
   echo "minecell: no-download mode: nothing will be downloaded, only what is already in $cachedir is used" >&2
 else
   had=false; [ -f "$manifest" ] && had=true
+  vlog "contacting mojang (piston-meta) for the version manifest: $url (cached copy: $had)"
   zflag=(); $had && zflag=(-z "$manifest")
   if code=$(curl --connect-timeout 5 --max-time 60 -sL -R "${zflag[@]}" -o "$manifest.new" -w '%{http_code}' "$url"); then
+    vlog "version manifest: http $code"
     case "$code" in
       200) mv "$manifest.new" "$manifest" ;;
       304) rm -f "$manifest.new" ;;
       *)   rm -f "$manifest.new"; echo "minecell: unexpected http $code" >&2; exit 1 ;;
     esac
   else
+    vlog "version manifest request failed"
     rm -f "$manifest.new"
     nodl="true"
     echo "minecell: could not reach mojang, switching to no-download mode: nothing will be downloaded" >&2
   fi
 fi
 if $list; then
+  vlog "listing versions (snapshots: $snapshot, no-download: $nodl)"
   if $nodl; then
     localversions | while read -r id; do
       vtype "$id"
@@ -423,13 +438,16 @@ if $fabric; then
   mcver="$version"
   fv=""
   if ! $nodl; then
+    vlog "contacting fabric meta for the latest loader of $mcver"
     fv="$(curl -fsSL "https://meta.fabricmc.net/v2/versions/loader/$mcver" \
           | jq -er '([.[] | select(.loader.stable)] + .)[0].loader.version')" || fv=""
   fi
   if [ -n "$fv" ]; then
     fid="fabric-loader-$fv-$mcver"
     fjson="$cachedir/versions/$fid/$fid.json"
+    vlog "fabric loader $fv, profile $fid"
     if ! [ -f "$fjson" ]; then
+      vlog "downloading the fabric profile json for $fid from meta.fabricmc.net"
       mkdir -p "$(dirname "$fjson")"
       curl -fsSL -o "$fjson.new" "https://meta.fabricmc.net/v2/versions/loader/$mcver/$fv/profile/json" \
         && jq -e .id "$fjson.new" > /dev/null \
@@ -448,6 +466,7 @@ if $fabric; then
   fi
   version="$fid"
 fi
+vlog "chosen version: $version"
 echo "version $version"
 # each version keeps its jar (and natives) in its own dir; they all share the one instance dir
 versiondir="$cachedir/versions/$version"
@@ -456,16 +475,18 @@ mkdir -p "$versiondir" "$gamedir"
 # fetchjson VER: make sure versions/VER/VER.json exists, downloading it from the manifest if not
 fetchjson() {
   local v="$1" f="$cachedir/versions/$1/$1.json" u sha
-  [ -f "$f" ] && return 0
+  if [ -f "$f" ]; then vlog "version json for $v already downloaded"; return 0; fi
   if $nodl; then echo "minecell: $v is not downloaded and no-download mode is on" >&2; return 1; fi
   mkdir -p "$(dirname "$f")"
   u="$(jq -er --arg v "$v" '.versions[] | select(.id == $v) | .url' "$manifest")" \
     || { echo "minecell: $v is not in the manifest and has no local json" >&2; return 1; }
   sha="$(jq -er --arg v "$v" '.versions[] | select(.id == $v) | .sha1' "$manifest")"
+  vlog "downloading the version json for $v from $u"
   curl -fsSL -o "$f.new" "$u" || { rm -f "$f.new"; echo "minecell: version json download failed" >&2; return 1; }
   if [ "$(sha1sum < "$f.new" | cut -d' ' -f1)" != "$sha" ]; then
     rm -f "$f.new"; echo "minecell: version json sha1 mismatch" >&2; return 1
   fi
+  vlog "version json for $v: sha1 ok"
   mv "$f.new" "$f"
 }
 fetchjson "$version" || exit 1
@@ -477,6 +498,7 @@ if [ -n "$parent" ]; then
   case "$parent" in */*) echo "minecell: bad inheritsFrom: $parent" >&2; exit 1 ;; esac
   fetchjson "$parent" || exit 1
   jarver="$parent"
+  vlog "$version inherits from $parent: merging the two version jsons"
   merged="$tmpdir/merged.json"
   jq -s '.[0] as $p | .[1] as $c | ($p * $c) + {
       libraries: (($c.libraries // []) + ($p.libraries // [])),
@@ -495,6 +517,7 @@ clientsha1="$(getj .downloads.client.sha1)" || exit 1
 assetsid="$(getj .assetIndex.id)" || exit 1
 assetsurl="$(getj .assetIndex.url)" || exit 1
 assetssha1="$(getj .assetIndex.sha1)" || exit 1
+vlog "main class $mainclass, type $versiontype, needs java $javamajor, asset index $assetsid, client jar $clienturl"
 
 # ---- which java to run ----
 # -j / the config wins unless it is too old. otherwise: the system java if it is new enough for this version, else the one in
@@ -508,6 +531,7 @@ getjava() {
     aarch64|arm64) arch=aarch64 ;;
     *) echo "minecell: no automatic java download for $(uname -m), install java $javamajor yourself" >&2; return 1 ;;
   esac
+  vlog "contacting adoptium (api.adoptium.net) for a java $javamajor jre ($arch)"
   os=linux; if ldd --version 2>&1 | grep -qi musl; then os=alpine-linux; fi
   meta="$(curl -fsSL "https://api.adoptium.net/v3/assets/latest/$javamajor/hotspot?architecture=$arch&image_type=jre&os=$os&vendor=eclipse")" \
     || { echo "minecell: could not ask adoptium for java $javamajor" >&2; return 1; }
@@ -517,10 +541,12 @@ getjava() {
   rm -rf "$cachedir"/java/.download.*
   dl="$cachedir/java/.download.$$"; mkdir -p "$dl"
   echo "minecell: no suitable java found, downloading java $javamajor (eclipse temurin jre, $(jq -r '.[0].binary.package.size / 1048576 | floor' <<< "$meta") MB)" >&2
+  vlog "downloading java from $link"
   curl -fL# -o "$dl/jre.tar.gz" "$link" || { rm -rf "$dl"; echo "minecell: java download failed" >&2; return 1; }
   if [ "$(sha256sum < "$dl/jre.tar.gz" | cut -d' ' -f1)" != "$sum" ]; then
     rm -rf "$dl"; echo "minecell: java download has the wrong checksum" >&2; return 1
   fi
+  vlog "java download: sha256 ok, unpacking"
   tar -xzf "$dl/jre.tar.gz" -C "$dl" || { rm -rf "$dl"; echo "minecell: could not unpack java" >&2; return 1; }
   top="$(find "$dl" -mindepth 1 -maxdepth 1 -type d | head -1)"
   [ -x "$top/bin/java" ] || { rm -rf "$dl"; echo "minecell: the java download has no bin/java" >&2; return 1; }
@@ -539,8 +565,9 @@ fi
 if [ "$java" = "java" ]; then
   sysjava=""; $skipsys || { command -v java > /dev/null && sysjava="$(javamajor_of java)"; }
   if [ -n "$sysjava" ] && [ "$sysjava" -ge "$javamajor" ]; then
-    : # the system java is new enough
+    vlog "using the system java ($sysjava >= $javamajor)"
   elif [ -x "$cachedir/java/$javamajor/bin/java" ]; then
+    vlog "using minecell's downloaded java $javamajor"
     java="$cachedir/java/$javamajor/bin/java"
   elif $nodl; then
     # nothing to download: an old system java is reported by the version check at the end
@@ -568,15 +595,18 @@ mapfile -t libs < <(jq -r '.libraries[]
 # plain-string arguments only (the ones with rules come later); ${placeholders} still to be filled in
 mapfile -t jvmargs < <(jq -r '.arguments.jvm[] | strings' "$gamejson")
 mapfile -t gameargs < <(jq -r '.arguments.game[] | strings' "$gamejson")
+vlog "${#libs[@]} libraries apply to linux, ${#jvmargs[@]} jvm args, ${#gameargs[@]} game args"
 # fetch URL FILE SHA1: download to FILE unless it is already there with the right sha1
 fetch() {
   # no-download mode: a file is either there or it is not
-  if $nodl; then [ -f "$2" ]; return; fi
+  if $nodl; then vlog "no-download: $2 present: $([ -f "$2" ] && echo yes || echo no)"; [ -f "$2" ]; return; fi
   # an empty sha1 (maven-style libraries) means: present is good enough, and nothing to check after
-  if [ -f "$2" ] && { [ -z "$3" ] || [ "$(sha1sum < "$2" | cut -d' ' -f1)" = "$3" ]; }; then return 0; fi
+  if [ -f "$2" ] && { [ -z "$3" ] || [ "$(sha1sum < "$2" | cut -d' ' -f1)" = "$3" ]; }; then vlog "cached, sha1 ok: $2"; return 0; fi
   mkdir -p "$(dirname "$2")"
+  vlog "downloading $1 -> $2"
   curl -fsSL -o "$2.new" "$1" || { rm -f "$2.new"; return 1; }
   if [ -n "$3" ] && [ "$(sha1sum < "$2.new" | cut -d' ' -f1)" != "$3" ]; then rm -f "$2.new"; return 1; fi
+  vlog "downloaded, sha1 ok: $2"
   mv "$2.new" "$2"
 }
 dlfail() {
@@ -585,9 +615,11 @@ dlfail() {
 }
 clientjar="$cachedir/versions/$jarver/$jarver.jar"
 fetch "$clienturl" "$clientjar" "$clientsha1" || { dlfail "the client jar"; exit 1; }
+vlog "checking the client jar"
 assetsdir="$cachedir/assets"
 assetindex="$assetsdir/indexes/$assetsid.json"
 fetch "$assetsurl" "$assetindex" "$assetssha1" || { dlfail "the asset index"; exit 1; }
+vlog "checking the asset objects (resources.download.minecraft.net)"
 # the objects are named after their own sha1, so only the missing ones are downloaded
 missing="$tmpdir/missing"
 jq -r '.objects[].hash' "$assetindex" | sort -u | while read -r h; do
@@ -599,13 +631,15 @@ if $nodl && [ -s "$missing" ]; then
 fi
 if [ -s "$missing" ]; then
   total="$(wc -l < "$missing")"
+  vlog "$total asset objects missing, downloading them 8 at a time from resources.download.minecraft.net"
   donefile="$tmpdir/done"; : > "$donefile"
   export assetsdir donefile
+  xtrace=""; [ "$verbose" -ge 3 ] && xtrace="-x"; export xtrace
   # each finished asset appends one byte to $donefile, so its size is the count
   # job control gives xargs its own process group, so ctrl-c can kill it and its curls
   # (a plain background job ignores SIGINT and would keep downloading after the script died)
   set -m
-  xargs -P 8 -n 1 bash -c '
+  xargs -P 8 -n 1 bash $xtrace -c '
     h="$1"; d="$assetsdir/objects/${h:0:2}"; mkdir -p "$d"
     t="$d/$h.new.$$"
     if curl -fsSL -o "$t" "https://resources.download.minecraft.net/${h:0:2}/$h" \
@@ -638,6 +672,7 @@ if $needlibs && $nodl; then
   echo "minecell: some libraries are not downloaded and no-download mode is on (run once without --no-download)" >&2
   exit 1
 fi
+vlog "libraries missing: $needlibs"
 if $needlibs; then
   nlibs="${#libs[@]}"; n=0
   for line in "${libs[@]}"; do
@@ -649,6 +684,7 @@ if $needlibs; then
   echo
 fi
 # worlds live outside the instance; link them in
+vlog "linking $gamedir/saves to $worlds"
 mkdir -p "$worlds"
 if [ -L "$gamedir/saves" ] || ! [ -e "$gamedir/saves" ]; then
   ln -sfn "$worlds" "$gamedir/saves"
@@ -693,7 +729,7 @@ else
   ms_pid=""; ms_cap=""; ms_verifier=""; ms_state=""
 fi
 authfile="$cachedir/auth.json"
-mspost() { curl -sS -H 'Content-Type: application/json' -H 'Accept: application/json' -d "$2" "$1"; }
+mspost() { vlog "contacting $1"; curl -sS -H 'Content-Type: application/json' -H 'Accept: application/json' -d "$2" "$1"; }
 msfail() { echo "minecell: $*" >&2; return 1; }
 # "press o" opens the consent link of the app, which redirects to the registered localhost uri. python3 catches
 # that redirect and the code in it is traded for a token (pkce), so the link also logs in by itself; typing the
@@ -760,19 +796,26 @@ msauth() {
   local xbl xblhash xsts xstshash xerr prof raw mcexp
   now=$(date +%s)
   # a minecraft token that is still valid is used as is
+  vlog "microsoft login: client id $msclient, token endpoint $ms_token_url"
   if [ -f "$authfile" ] && jq -e --argjson now "$now" '(.mc_expires // 0) > ($now + 120)' "$authfile" > /dev/null 2>&1; then
+    vlog "saved minecraft token is still valid, no login needed"
     mcname=$(jq -r .name "$authfile"); mcuuid=$(jq -r .uuid "$authfile"); mctoken=$(jq -r .mc_token "$authfile")
     return 0
   fi
   if $nodl; then msfail "no-download mode: there is no valid saved login, and logging in needs the internet"; return 1; fi
   rt=""; [ -f "$authfile" ] && rt=$(jq -r '.refresh_token // empty' "$authfile")
   if [ -n "$rt" ]; then
+    vlog "contacting microsoft api ($ms_token_url): exchanging the saved refresh token for a new access token"
     resp=$(curl -sS -d "client_id=$msclient" -d "grant_type=refresh_token" --data-urlencode "refresh_token=$rt" \
            --data-urlencode "scope=$ms_scope" "$ms_token_url")
     ms_access=$(jq -r '.access_token // empty' <<< "$resp")
     ms_refresh=$(jq -r '.refresh_token // empty' <<< "$resp")
+    if [ -n "$ms_access" ]; then vlog "refresh token accepted"; else vlog "refresh token refused: $(jq -r '.error // "no answer"' <<< "$resp")"; fi
+  else
+    vlog "no saved refresh token"
   fi
   if [ -z "$ms_access" ]; then
+    vlog "contacting microsoft api ($ms_devicecode_url): requesting a device code"
     resp=$(curl -sS -d "client_id=$msclient" --data-urlencode "scope=$ms_scope" \
            "${ms_devicecode_extra[@]}" "$ms_devicecode_url")
     user_code=$(jq -r '.user_code // empty' <<< "$resp")
@@ -802,6 +845,7 @@ msauth() {
       ms_listen_start
       [ -z "$ms_pid" ] || echo "OPEN $ms_open_url" >&2
     fi
+    vlog "got device code $user_code (verification uri $uri, poll every ${interval}s, expires in ${expires}s), waiting for the user to log in"
     end=$(( $(date +%s) + expires )); last=$(date +%s)
     while [ "$(date +%s)" -lt "$end" ]; do
       if $canopen; then
@@ -813,9 +857,10 @@ msauth() {
       else
         sleep 1
       fi
-      if ms_listen_exchange; then break; fi
+      if ms_listen_exchange; then vlog "exchanged the authorization code from the consent link for a token"; break; fi
       [ $(( $(date +%s) - last )) -ge "$interval" ] || continue
       last=$(date +%s)
+      vlog "contacting microsoft api ($ms_token_url): polling for the device code login"
       resp=$(curl -sS -d "client_id=$msclient" -d "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
              --data-urlencode "device_code=$dev" "$ms_token_url")
       ms_access=$(jq -r '.access_token // empty' <<< "$resp")
@@ -828,10 +873,14 @@ msauth() {
     ms_listen_stop
     [ -n "$ms_access" ] || { msfail "the login code expired, run it again"; return 1; }
   fi
+  vlog "got a microsoft access token"
+  vlog "authenticating with xbox live: exchanging the microsoft token for an xbl token"
   resp=$(mspost https://user.auth.xboxlive.com/user/authenticate "$(jq -n --arg t "$ms_access" --arg p "$ms_rps" \
          '{Properties:{AuthMethod:"RPS",SiteName:"user.auth.xboxlive.com",RpsTicket:($p + $t)},RelyingParty:"http://auth.xboxlive.com",TokenType:"JWT"}')")
   xbl=$(jq -r '.Token // empty' <<< "$resp")
   [ -n "$xbl" ] || { msfail "xbox live login failed"; return 1; }
+  vlog "got an xbl token"
+  vlog "exchanging the xbl token for an xsts token (relying party rp://api.minecraftservices.com/)"
   resp=$(mspost https://xsts.auth.xboxlive.com/xsts/authorize "$(jq -n --arg t "$xbl" \
          '{Properties:{SandboxId:"RETAIL",UserTokens:[$t]},RelyingParty:"rp://api.minecraftservices.com/",TokenType:"JWT"}')")
   xsts=$(jq -r '.Token // empty' <<< "$resp"); xstshash=$(jq -r '.DisplayClaims.xui[0].uhs // empty' <<< "$resp")
@@ -845,14 +894,20 @@ msauth() {
     esac
     return 1
   fi
+  vlog "got an xsts token (user hash $xstshash)"
+  vlog "exchanging the xsts token for a minecraft access token"
   resp=$(mspost https://api.minecraftservices.com/authentication/login_with_xbox "$(jq -n --arg h "$xstshash" --arg t "$xsts" \
          '{identityToken:("XBL3.0 x=" + $h + ";" + $t)}')")
   mctoken=$(jq -r '.access_token // empty' <<< "$resp"); mcexp=$(jq -r '.expires_in // 86400' <<< "$resp")
   [ -n "$mctoken" ] || { msfail "minecraft login failed: $(jq -r '.errorMessage // .error // "no answer"' <<< "$resp")"; return 1; }
+  vlog "got a minecraft access token (valid ${mcexp}s)"
+  vlog "contacting api.minecraftservices.com: fetching the minecraft java profile"
   prof=$(curl -sS -H "Authorization: Bearer $mctoken" https://api.minecraftservices.com/minecraft/profile)
   mcname=$(jq -r '.name // empty' <<< "$prof"); raw=$(jq -r '.id // empty' <<< "$prof")
   [ -n "$mcname" ] && [ -n "$raw" ] || { msfail "this account has no minecraft java profile (does it own the game?)"; return 1; }
   mcuuid="${raw:0:8}-${raw:8:4}-${raw:12:4}-${raw:16:4}-${raw:20:12}"
+  vlog "profile: $mcname ($mcuuid)"
+  vlog "saving the refresh token and minecraft token to $authfile (mode 600)"
   # keep the refresh token and the minecraft token for next time, readable by this user only
   ( umask 077
     jq -n --arg rt "${ms_refresh:-$rt}" --arg tok "$mctoken" --arg name "$mcname" --arg uuid "$mcuuid" --argjson exp $(( $(date +%s) + mcexp )) \
@@ -865,6 +920,7 @@ offline_uuid() {
   uuid="${h:0:8}-${h:8:4}-${h:12:4}-${h:16:4}-${h:20:12}"
 }
 if $online && ! $dryrun; then
+  vlog "online mode: logging in with a microsoft account"
   msauth || exit 1
   if $loginonly; then echo "minecell: logged in as $mcname" >&2; exit 0; fi
   name="$mcname"; uuid="$mcuuid"; usertype="msa"
@@ -875,10 +931,12 @@ elif [ -n "$skinof" ]; then
   # use a real account's uuid so the client fetches its skin from mojang's session server
   [[ "$skinof" =~ ^[A-Za-z0-9_]{1,16}$ ]] || { echo "minecell: $skinof is not a valid minecraft name" >&2; exit 1; }
   skincache="$cachedir/skin-$skinof"
+  vlog "skin of $skinof: looking up the uuid (cache file $skincache)"
   if $nodl; then
     raw="$(cat "$skincache" 2>/dev/null)"
     [ -n "$raw" ] || echo "minecell: warning: no-download mode and no saved uuid for $skinof, using the offline uuid" >&2
   else
+    vlog "contacting api.mojang.com for the uuid of $skinof"
     raw="$(curl -fsL "https://api.mojang.com/users/profiles/minecraft/$skinof" | jq -er .id)" \
       || { echo "minecell: could not find a minecraft account named $skinof" >&2; exit 1; }
     printf '%s\n' "$raw" > "$skincache"
@@ -889,8 +947,10 @@ elif [ -n "$skinof" ]; then
     offline_uuid
   fi
 else
+  vlog "offline mode: computing the offline uuid for $name"
   offline_uuid
 fi
+vlog "player $name, uuid $uuid, user type $usertype"
 mkdir -p "$versiondir/natives"
 declare -A ph=(
   [auth_player_name]="$name" [auth_uuid]="$uuid" [auth_access_token]="${mctoken:-0}"
@@ -921,6 +981,7 @@ cmd+=("$mainclass")
 for a in "${gameargs[@]}"; do cmd+=("$(subst "$a")"); done
 if [ -n "$server" ]; then cmd+=(--quickPlayMultiplayer "$joinaddr"); fi
 cmd+=("${extra[@]}")
+vlog "built the java command: ${#cmd[@]} arguments, classpath of ${#libs[@]} libraries plus the client jar"
 {
   echo "minecell: config"
   printf '  %-9s %s\n' "player" "$name ($uuid)$($online && echo ' [microsoft login]')"
@@ -955,7 +1016,7 @@ if $dryrun; then
   fi
   exit 0
 fi
-if $verbose; then
+if [ "$verbose" -ge 1 ]; then
   {
     echo "minecell: running:"
     if $fakeonline; then
@@ -971,7 +1032,9 @@ if [ -z "$have" ] || [ "$have" -lt "$javamajor" ]; then
   echo "minecell: this version needs java $javamajor or newer (found: ${have:-none})" >&2
   exit 1
 fi
+vlog "java $java is $have, needs $javamajor"
 if $fakeonline; then
+  vlog "fake online mode: starting viaproxy on 127.0.0.1:$port towards $server, proxy log $viaproxydir/logs/minecell.log"
   yml="$viaproxydir/viaproxy.yml"
   # point viaproxy at the target server, on the random local port, logging in with its saved account
   sed -i -e "s|^bind-address:.*|bind-address: 127.0.0.1:$port|" \
@@ -991,6 +1054,7 @@ if $fakeonline; then
   trap 'kill "$proxypid" 2>/dev/null' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  vlog "viaproxy started (pid $proxypid), waiting for port $port"
   up=false
   for _ in $(seq 1 60); do
     kill -0 "$proxypid" 2>/dev/null || break
@@ -1002,8 +1066,9 @@ if $fakeonline; then
     tail -n 15 "$proxylog" >&2
     exit 1
   fi
+  vlog "viaproxy is up, starting the game (not exec'd: the proxy is stopped afterwards)"
   # not exec: the proxy has to be stopped when the game exits
-  if $verbose; then
+  if [ "$verbose" -ge 1 ]; then
     ( cd "$gamedir" && "${cmd[@]}" )
   else
     ( cd "$gamedir" && "${cmd[@]}" ) > /dev/null 2>&1
@@ -1011,5 +1076,6 @@ if $fakeonline; then
   exit $?
 fi
 cd "$gamedir" || exit 1
-if $verbose; then exec "${cmd[@]}"; fi
+vlog "starting the game in $gamedir"
+if [ "$verbose" -ge 1 ]; then exec "${cmd[@]}"; fi
 exec "${cmd[@]}" > /dev/null 2>&1
