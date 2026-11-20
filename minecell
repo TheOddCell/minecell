@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="4.2.0"
+VERSION="4.3.0"
 tmpdir="$(mktemp -d)"
 cachedir="$HOME/.odd/minecell"
 snapshot="false"
@@ -1077,5 +1077,9 @@ if $fakeonline; then
 fi
 cd "$gamedir" || exit 1
 vlog "starting the game in $gamedir"
+if [ -d "$cachedir/assets.custom" ]; then
+  vlog "copying customized assets..."
+  cp -r "$cachedir/assets.custom/." "$cachedir/assets/."
+fi
 if [ "$verbose" -ge 1 ]; then exec "${cmd[@]}"; fi
 exec "${cmd[@]}" > /dev/null 2>&1
