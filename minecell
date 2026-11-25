@@ -20,6 +20,9 @@ server=""
 want=""
 notype="false"
 loginonly="false"
+exportauth="false"
+uploadauth="false"
+importauth=""
 skinof=""
 fabric="false"
 online="false"
@@ -124,6 +127,13 @@ launches the latest release (or the latest snapshot with -s), or the version giv
                      twice (-VV): also log everything minecell does, e.g. "contacting microsoft api"
                      three times (-VVV): all of that plus set -x (careful: it shows tokens)
       --login-only   log in with a microsoft account (like -o) and stop there, without launching
+      --export-auth  log in fresh (ignores any saved auth), print the auth JSON to stdout, and stop;
+                     pipe it to --upload-auth to share with another machine
+      --upload-auth  log in fresh, upload the auth JSON to 0x0.tarxz.zip for one minute, and print
+                     a base64 code you can pass to --import-auth on another machine
+                     WARNING: anyone who has the code can use your account for the minute it is live
+      --import-auth CODE  download the auth uploaded by --upload-auth and use it for this session
+                     (never saved to disk); CODE is the base64 string printed by --upload-auth
       --dry-run      print the java command instead of running it
   +X, ++option       the exact opposite of -X/--option, for overriding the config file (the last one given wins):
                      +s goes back to releases, +o +f +N +T +l turn those off, +V drops all verbosity, and +d +n +m +j +S +v +k forget
@@ -192,6 +202,10 @@ for i in "${eargs[@]}"; do
     skinof="$i"
     continue
   fi
+  if [ "$importauth" = "hahayoubrokesomething" ]; then
+    importauth="$i"
+    continue
+  fi
   if [ "${i:0:1}" = "+" ]; then
     # the opposite of the - option: back to the built-in default, whatever the config file said
     case "$i" in
@@ -211,6 +225,9 @@ for i in "${eargs[@]}"; do
       +V|++verbose) verbose=0 ;;
       +l|++list) list="false" ;;
       ++login-only) loginonly="false"; online="false" ;;
+      ++export-auth) exportauth="false"; online="false" ;;
+      ++upload-auth) uploadauth="false"; online="false" ;;
+      ++import-auth) importauth="" ;;
       ++dry-run) dryrun="false" ;;
       *) echo "minecell: unknown option: $i" >&2; exit 1 ;;
     esac
@@ -262,6 +279,17 @@ for i in "${eargs[@]}"; do
     online="true"
     loginonly="true"
     continue
+  elif [ "$i" = "--export-auth" ]; then
+    online="true"
+    exportauth="true"
+    continue
+  elif [ "$i" = "--upload-auth" ]; then
+    online="true"
+    uploadauth="true"
+    continue
+  elif [ "$i" = "--import-auth" ]; then
+    importauth="hahayoubrokesomething"
+    continue
   elif [ "$i" = "--dry-run" ]; then
     dryrun="true"
     continue
@@ -294,7 +322,7 @@ for i in "${eargs[@]}"; do
   echo "minecell: unexpected argument: $i (use -v to pick a version)" >&2
   exit 1
 done
-for v in "$gamedir" "$name" "$mem" "$java" "$server" "$want" "$skinof"; do
+for v in "$gamedir" "$name" "$mem" "$java" "$server" "$want" "$skinof" "$importauth"; do
   if [ "$v" = "hahayoubrokesomething" ]; then
     echo "minecell: option is missing its value" >&2
     exit 1
@@ -467,7 +495,7 @@ if $fabric; then
   version="$fid"
 fi
 vlog "chosen version: $version"
-echo "version $version"
+if ! $loginonly && ! $exportauth && ! $uploadauth && [ -z "$importauth" ]; then echo "version $version"; fi
 # each version keeps its jar (and natives) in its own dir; they all share the one instance dir
 versiondir="$cachedir/versions/$version"
 gamejson="$versiondir/$version.json"
@@ -795,15 +823,15 @@ msauth() {
   local now rt resp ms_access="" ms_refresh="" dev user_code uri interval expires end last err qr qrw qrurl first disp line
   local xbl xblhash xsts xstshash xerr prof raw mcexp
   now=$(date +%s)
-  # a minecraft token that is still valid is used as is
+  # a minecraft token that is still valid is used as is (skipped for export/upload: always do a fresh login)
   vlog "microsoft login: client id $msclient, token endpoint $ms_token_url"
-  if [ -f "$authfile" ] && jq -e --argjson now "$now" '(.mc_expires // 0) > ($now + 120)' "$authfile" > /dev/null 2>&1; then
+  if ! $exportauth && ! $uploadauth && [ -f "$authfile" ] && jq -e --argjson now "$now" '(.mc_expires // 0) > ($now + 120)' "$authfile" > /dev/null 2>&1; then
     vlog "saved minecraft token is still valid, no login needed"
     mcname=$(jq -r .name "$authfile"); mcuuid=$(jq -r .uuid "$authfile"); mctoken=$(jq -r .mc_token "$authfile")
     return 0
   fi
   if $nodl; then msfail "no-download mode: there is no valid saved login, and logging in needs the internet"; return 1; fi
-  rt=""; [ -f "$authfile" ] && rt=$(jq -r '.refresh_token // empty' "$authfile")
+  rt=""; ! $exportauth && ! $uploadauth && [ -f "$authfile" ] && rt=$(jq -r '.refresh_token // empty' "$authfile")
   if [ -n "$rt" ]; then
     vlog "contacting microsoft api ($ms_token_url): exchanging the saved refresh token for a new access token"
     resp=$(curl -sS -d "client_id=$msclient" -d "grant_type=refresh_token" --data-urlencode "refresh_token=$rt" \
@@ -907,11 +935,18 @@ msauth() {
   [ -n "$mcname" ] && [ -n "$raw" ] || { msfail "this account has no minecraft java profile (does it own the game?)"; return 1; }
   mcuuid="${raw:0:8}-${raw:8:4}-${raw:12:4}-${raw:16:4}-${raw:20:12}"
   vlog "profile: $mcname ($mcuuid)"
-  vlog "saving the refresh token and minecraft token to $authfile (mode 600)"
-  # keep the refresh token and the minecraft token for next time, readable by this user only
-  ( umask 077
-    jq -n --arg rt "${ms_refresh:-$rt}" --arg tok "$mctoken" --arg name "$mcname" --arg uuid "$mcuuid" --argjson exp $(( $(date +%s) + mcexp )) \
-      '{refresh_token:$rt, mc_token:$tok, mc_expires:$exp, name:$name, uuid:$uuid}' > "$authfile.new" ) && mv "$authfile.new" "$authfile" && chmod 600 "$authfile"
+  if $exportauth || $uploadauth; then
+    vlog "export/upload mode: building auth JSON in memory (not saved to disk)"
+    authexport=$(jq -n --arg rt "${ms_refresh:-$rt}" --arg tok "$mctoken" --arg name "$mcname" --arg uuid "$mcuuid" \
+      --argjson exp $(( $(date +%s) + mcexp )) \
+      '{refresh_token:$rt, mc_token:$tok, mc_expires:$exp, name:$name, uuid:$uuid}')
+  else
+    vlog "saving the refresh token and minecraft token to $authfile (mode 600)"
+    # keep the refresh token and the minecraft token for next time, readable by this user only
+    ( umask 077
+      jq -n --arg rt "${ms_refresh:-$rt}" --arg tok "$mctoken" --arg name "$mcname" --arg uuid "$mcuuid" --argjson exp $(( $(date +%s) + mcexp )) \
+        '{refresh_token:$rt, mc_token:$tok, mc_expires:$exp, name:$name, uuid:$uuid}' > "$authfile.new" ) && mv "$authfile.new" "$authfile" && chmod 600 "$authfile"
+  fi
 }
 # offline uuid: md5 of "OfflinePlayer:<name>" with the version (3) and variant bits forced
 offline_uuid() {
@@ -923,10 +958,37 @@ if $online && ! $dryrun; then
   vlog "online mode: logging in with a microsoft account"
   msauth || exit 1
   if $loginonly; then echo "minecell: logged in as $mcname" >&2; exit 0; fi
+  if $exportauth; then
+    printf '%s\n' "$authexport"
+    exit 0
+  fi
+  if $uploadauth; then
+    expires_ms=$(( ($(date +%s) + 60) * 1000 ))
+    echo "minecell: uploading auth to 0x0.tarxz.zip (expires in 60 seconds)" >&2
+    url=$(printf '%s\n' "$authexport" | curl -sS -F 'file=@-' -F "expires=$expires_ms" -F 'secret=' https://0x0.tarxz.zip) \
+      || { echo "minecell: upload failed" >&2; exit 1; }
+    path="${url#https://0x0.tarxz.zip}"
+    [ -n "$path" ] && [ "$path" != "$url" ] || { echo "minecell: upload returned an unexpected response: $url" >&2; exit 1; }
+    printf '%s\n' "$(printf '%s' "$path" | base64 -w0)"
+    exit 0
+  fi
   name="$mcname"; uuid="$mcuuid"; usertype="msa"
 elif $online; then
   uuid="00000000-0000-0000-0000-000000000000"; mctoken="<access token>"; usertype="msa"
   echo "minecell: --dry-run does not log in, so the real name, uuid and token are not shown" >&2
+elif [ -n "$importauth" ]; then
+  vlog "import-auth: decoding and downloading shared auth (not saved to disk)"
+  authbasename=$(printf '%s' "$importauth" | base64 -d 2>/dev/null) \
+    || { echo "minecell: --import-auth: invalid base64 code" >&2; exit 1; }
+  tmpauth=$(curl -fsS "https://0x0.tarxz.zip$authbasename") \
+    || { echo "minecell: --import-auth: download failed (code may have expired)" >&2; exit 1; }
+  mcname=$(jq -r '.name // empty' <<< "$tmpauth")
+  mcuuid=$(jq -r '.uuid // empty' <<< "$tmpauth")
+  mctoken=$(jq -r '.mc_token // empty' <<< "$tmpauth")
+  [ -n "$mcname" ] && [ -n "$mcuuid" ] && [ -n "$mctoken" ] \
+    || { echo "minecell: --import-auth: could not read the auth JSON (may have expired or been tampered with)" >&2; exit 1; }
+  name="$mcname"; uuid="$mcuuid"; usertype="msa"
+  vlog "import-auth: using $mcname ($mcuuid)"
 elif [ -n "$skinof" ]; then
   # use a real account's uuid so the client fetches its skin from mojang's session server
   [[ "$skinof" =~ ^[A-Za-z0-9_]{1,16}$ ]] || { echo "minecell: $skinof is not a valid minecraft name" >&2; exit 1; }

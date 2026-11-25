@@ -32,6 +32,13 @@ launches the latest release (or the latest snapshot with -s), or the version giv
                      twice (-VV): also log everything minecell does, e.g. "contacting microsoft api"
                      three times (-VVV): all of that plus set -x (careful: it shows tokens)
       --login-only   log in with a microsoft account (like -o) and stop there, without launching
+      --export-auth  log in fresh (ignores any saved auth), print the auth JSON to stdout, and stop;
+                     pipe it to --upload-auth to share with another machine
+      --upload-auth  log in fresh, upload the auth JSON to 0x0.tarxz.zip for one minute, and print
+                     a base64 code you can pass to --import-auth on another machine
+                     WARNING: anyone who has the code can use your account for the minute it is live
+      --import-auth CODE  download the auth uploaded by --upload-auth and use it for this session
+                     (never saved to disk); CODE is the base64 string printed by --upload-auth
       --dry-run      print the java command instead of running it
   +X, ++option       the exact opposite of -X/--option, for overriding the config file (the last one given wins):
                      +s goes back to releases, +o +f +N +T +l turn those off, +V drops all verbosity, and +d +n +m +j +S +v +k forget
