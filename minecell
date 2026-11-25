@@ -288,6 +288,7 @@ for i in "${eargs[@]}"; do
     uploadauth="true"
     continue
   elif [ "$i" = "--import-auth" ]; then
+    online="false"
     importauth="hahayoubrokesomething"
     continue
   elif [ "$i" = "--dry-run" ]; then
@@ -937,9 +938,9 @@ msauth() {
   vlog "profile: $mcname ($mcuuid)"
   if $exportauth || $uploadauth; then
     vlog "export/upload mode: building auth JSON in memory (not saved to disk)"
-    authexport=$(jq -n --arg rt "${ms_refresh:-$rt}" --arg tok "$mctoken" --arg name "$mcname" --arg uuid "$mcuuid" \
+    authexport=$(jq -n --arg tok "$mctoken" --arg name "$mcname" --arg uuid "$mcuuid" \
       --argjson exp $(( $(date +%s) + mcexp )) \
-      '{refresh_token:$rt, mc_token:$tok, mc_expires:$exp, name:$name, uuid:$uuid}')
+      '{mc_token:$tok, mc_expires:$exp, name:$name, uuid:$uuid}')
   else
     vlog "saving the refresh token and minecraft token to $authfile (mode 600)"
     # keep the refresh token and the minecraft token for next time, readable by this user only
